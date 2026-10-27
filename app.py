@@ -71,7 +71,7 @@ SPORTS = {
             "WR": ["REC", "TGT", "REC YDS", "REC TD", "LNG REC", "RUSH+REC YDS"],
             "TE": ["REC", "TGT", "REC YDS", "REC TD", "LNG REC"],
         },
-        "default_line": 49.5,
+        "default_line": 35.5,
     },
 }
 
