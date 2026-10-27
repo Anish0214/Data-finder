@@ -14,6 +14,7 @@
 import datetime as dt
 import html
 import io
+import unicodedata
 import math
 from concurrent.futures import ThreadPoolExecutor
 from zoneinfo import ZoneInfo
@@ -123,6 +124,22 @@ THEMES["epl"] = {
               "linear-gradient(90deg, rgba(55,0,60,.75), rgba(55,0,60,0) 60%),"
               "repeating-linear-gradient(90deg, #3E8E41 0 80px, #357A38 80px 160px)",
 }
+
+
+def _pitch(rgb):
+    return (f"radial-gradient(circle at 85% 50%, transparent 62px, rgba(255,255,255,.85) 63px 66px, transparent 67px),"
+            f"linear-gradient(90deg, rgba({rgb},.78), rgba({rgb},0) 60%),"
+            "repeating-linear-gradient(90deg, #3E8E41 0 80px, #357A38 80px 160px)")
+
+
+THEMES["laliga"] = {"primary": "#0B2545", "accent": "#FF4B44", "bg": "#F5F6F8", "edition": "LA LIGA EDITION",
+                    "banner": _pitch("11,37,69")}
+THEMES["bundesliga"] = {"primary": "#1A1A1A", "accent": "#D20515", "bg": "#F6F5F5", "edition": "BUNDESLIGA EDITION",
+                        "banner": _pitch("26,26,26")}
+THEMES["ucl"] = {"primary": "#0A1E5C", "accent": "#00A3E0", "bg": "#F3F5FA", "edition": "CHAMPIONS LEAGUE EDITION",
+                 "banner": _pitch("10,30,92")}
+THEMES["uel"] = {"primary": "#1F1F1F", "accent": "#F68E1E", "bg": "#F7F5F2", "edition": "EUROPA LEAGUE EDITION",
+                 "banner": _pitch("31,31,31")}
 
 
 def inject_css(theme):
@@ -750,7 +767,7 @@ def build_insights(cfg, player, opponent, items, questionable, star_html="", ext
     if me:
         e = me["edge"]
         grade = ("g-good", "GOOD MATCHUP") if e >= EDGE else ("g-bad", "TOUGH MATCHUP") if e <= -EDGE else ("g-mid", "NEUTRAL")
-        last = html.escape(player["name"].split()[-1])
+        last = html.escape(short_name(player["name"]))
         word = STAT_WORDS.get(me["stat"], me["stat"])
         parts.append(f'<div class="insights-title">💡 Matchup insights <span class="grade {grade[0]}">{grade[1]}</span></div>')
         parts.append(
@@ -990,7 +1007,7 @@ def usage_line(player, trends):
         return ""
     fmt = (lambda v: f"{v:.0f}%") if "SHARE" in pick else (lambda v: f"{v:.1f}")
     word = "rising 📈" if change > 0 else "falling 📉"
-    return (f'<div class="ins-line">Usage {word}: {html.escape(player["name"].split()[-1])}\'s '
+    return (f'<div class="ins-line">Usage {word}: {html.escape(short_name(player["name"]))}\'s '
             f'{pick.lower()} is <b>{fmt(last)}</b> over his last {USAGE_RECENT} games vs <b>{fmt(full)}</b> '
             f'on the season.</div>')
 
@@ -1046,8 +1063,9 @@ def status_class(status):
 
 
 def _norm(name):
-    """'Jacory Croskey-Merritt' and 'jacory croskey merritt' should match."""
-    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+    """'Jacory Croskey-Merritt' == 'jacory croskey merritt', and 'Atlético' == 'Atletico'."""
+    plain = unicodedata.normalize("NFKD", name or "")
+    return "".join(ch for ch in plain.lower() if ch.isalnum() and not unicodedata.combining(ch))
 
 
 def injured_keys(rows, out):
@@ -1218,7 +1236,7 @@ def render_player(sport_name):
     else:
         cards = []
         for s in dvp_stats:
-            mine = (f'<div class="muted">{html.escape(player["name"].split()[-1])} avg: {history[s].mean():.1f}</div>'
+            mine = (f'<div class="muted">{html.escape(short_name(player["name"]))} avg: {history[s].mean():.1f}</div>'
                     if s in history.columns else "")
             cards.append(f'<div class="card"><div class="card-label">{html.escape(s)} allowed</div>'
                          f'<div class="card-value">{dvp[s].mean():.1f}</div>{mine}</div>')
@@ -1504,7 +1522,7 @@ def render_sport(sport_name):
 # ==========================================================
 EPL_KEY = "⚽ Premier League"
 FPL = "https://fantasy.premierleague.com/api"
-FD_URL = "https://www.football-data.co.uk/mmz4281/{code}/E0.csv"
+FD_URL = "https://www.football-data.co.uk/mmz4281/{code}/{div}.csv"
 EPL_POS = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
 EPL_COLORS = {  # club colors for the matchup banner (unknown clubs fall back to gray)
     "ARS": "EF0107", "AVL": "670E36", "BOU": "DA291C", "BRE": "E30613", "BHA": "0057B8", "BUR": "6C1D45",
@@ -1558,8 +1576,8 @@ def fd_season_code(seasons_ago=0):
 
 
 @st.cache_data(ttl=6 * 3600)
-def fd_matches(code):
-    r = requests.get(FD_URL.format(code=code), headers=HEADERS, timeout=20)
+def fd_matches(code, div="E0"):
+    r = requests.get(FD_URL.format(code=code, div=div), headers=HEADERS, timeout=20)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.content.decode("utf-8-sig", errors="replace")))
     df = df.dropna(subset=["HomeTeam", "AwayTeam"])
@@ -1567,12 +1585,12 @@ def fd_matches(code):
     return df
 
 
-def fd_all():
+def fd_all(div="E0"):
     """This season's matches plus last season's (for referees and early season team form)."""
     frames = []
     for ago in (0, 1):
         try:
-            d = fd_matches(fd_season_code(ago))
+            d = fd_matches(fd_season_code(ago), div)
             d["season_ago"] = ago
             frames.append(d)
         except Exception:
@@ -1606,14 +1624,14 @@ def fd_long(df):
 
 
 @st.cache_data(ttl=6 * 3600)
-def fd_long_cached():
-    return fd_long(fd_all())
+def fd_long_cached(div="E0"):
+    return fd_long(fd_all(div))
 
 
 @st.cache_data(ttl=6 * 3600)
-def epl_team_table():
+def epl_team_table(div="E0"):
     """Each team's averages over its last 10 league matches, plus the league average."""
-    long = fd_long(fd_all())
+    long = fd_long(fd_all(div))
     if long.empty:
         return {}, {}
     long = long.sort_values("date", ascending=False)
@@ -1656,6 +1674,7 @@ def fd_team_name(fpl_name):
 
 
 ESPN_SOCCER = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1"
+ESPN_SOCCER_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer/{code}"
 TEAM_ALIASES = {  # the same club is spelled differently by FPL, football-data and ESPN
     "manutd": "manchesterunited", "manunited": "manchesterunited", "mancity": "manchestercity",
     "spurs": "tottenham", "tottenhamhotspur": "tottenham", "nottmforest": "nottinghamforest",
@@ -1667,6 +1686,7 @@ TEAM_ALIASES = {  # the same club is spelled differently by FPL, football-data a
 ESPN_PLAYER_STATS = {  # ESPN stat name -> our column
     "totalShots": "SH", "shotsOnTarget": "SOT", "foulsCommitted": "FC", "foulsSuffered": "FS",
     "offsides": "OFF", "totalGoals": "ESPN G", "goalAssists": "ESPN A",
+    "yellowCards": "ESPN YC", "redCards": "ESPN RC", "saves": "ESPN SV",
 }
 
 
@@ -1676,9 +1696,9 @@ def canon(team_name):
 
 
 @st.cache_data(ttl=6 * 3600)
-def espn_day(date_str):
-    """All PL matches ESPN lists for one day (YYYYMMDD): event id + both clubs."""
-    data = get_json(f"{ESPN_SOCCER}/scoreboard", params={"dates": date_str})
+def espn_day(date_str, code="eng.1"):
+    """All matches ESPN lists for one day (YYYYMMDD) in a competition: event id + both clubs."""
+    data = get_json(f"{ESPN_SOCCER_BASE.format(code=code)}/scoreboard", params={"dates": date_str})
     out = []
     for event in data.get("events", []):
         clubs = [canon((c.get("team") or {}).get("displayName", ""))
@@ -1687,13 +1707,13 @@ def espn_day(date_str):
     return out
 
 
-def espn_find_event(team_a, team_b, when):
+def espn_find_event(team_a, team_b, when, code="eng.1"):
     """ESPN's id for the match between two clubs on (or a day either side of) a date."""
     a, b = canon(team_a), canon(team_b)
     for shift in (0, -1, 1):
         day = (when + dt.timedelta(days=shift)).strftime("%Y%m%d")
         try:
-            events = espn_day(day)
+            events = espn_day(day, code)
         except Exception:
             continue
         for e in events:
@@ -1704,9 +1724,9 @@ def espn_find_event(team_a, team_b, when):
 
 
 @st.cache_data(ttl=24 * 3600)  # finished matches never change
-def espn_match(event_id):
+def espn_match(event_id, code="eng.1"):
     """Referee + every player's stat line (shots, shots on target, fouls...) from one match."""
-    data = get_json(f"{ESPN_SOCCER}/summary", params={"event": event_id})
+    data = get_json(f"{ESPN_SOCCER_BASE.format(code=code)}/summary", params={"event": event_id})
     referee = ""
     for o in (data.get("gameInfo") or {}).get("officials", []) or []:
         pos = str((o.get("position") or {}).get("name") if isinstance(o.get("position"), dict) else o.get("position") or "")
@@ -1715,9 +1735,10 @@ def espn_match(event_id):
             break
     players = []
     for side in data.get("rosters", []) or []:
-        club = canon((side.get("team") or {}).get("displayName", ""))
+        club_name = (side.get("team") or {}).get("displayName", "")
+        club = canon(club_name)
         for p in side.get("roster", []) or []:
-            row = {"club": club, "name": (p.get("athlete") or {}).get("displayName", ""),
+            row = {"club": club, "club_name": club_name, "name": (p.get("athlete") or {}).get("displayName", ""),
                    "starter": bool(p.get("starter")),
                    "subbed_in": bool(p.get("subbedIn") if isinstance(p.get("subbedIn"), bool)
                                      else (p.get("subbedIn") or {}).get("didSub"))}
@@ -2313,19 +2334,825 @@ def render_epl():
         render_epl_player()
 
 
+# ==========================================================
+# MORE SOCCER: LA LIGA, BUNDESLIGA, CHAMPIONS LEAGUE, EUROPA LEAGUE
+# ESPN        -> fixtures, lineups, shots, shots on target, fouls, cards, injuries, referees
+# Understat   -> xG, xA, key passes, minutes (big 5 domestic leagues)
+# football-data.co.uk -> team corners, fouls, cards, shots (domestic leagues)
+# Champions / Europa League clubs borrow their DOMESTIC numbers (that's where most of their games are)
+# ==========================================================
+SOCCER_KEY = "⚽ Soccer"
+SOCCER_LEAGUES = {
+    "Premier League": {"key": "epl", "espn": "eng.1"},  # uses the richer FPL pages above
+    "La Liga": {"key": "laliga", "espn": "esp.1", "us": "La_liga", "fd": "SP1"},
+    "Bundesliga": {"key": "bundesliga", "espn": "ger.1", "us": "Bundesliga", "fd": "D1"},
+    "Champions League": {"key": "ucl", "espn": "uefa.champions", "europe": True},
+    "Europa League": {"key": "uel", "espn": "uefa.europa", "europe": True},
+}
+DOMESTIC = [  # (ESPN code, Understat slug, football-data division)
+    ("eng.1", "EPL", "E0"), ("esp.1", "La_liga", "SP1"), ("ger.1", "Bundesliga", "D1"),
+    ("ita.1", "Serie_A", "I1"), ("fra.1", "Ligue_1", "F1"),
+]
+UNDERSTAT = "https://understat.com"
+SOCCER_POS = {"G": "GK", "D": "DEF", "M": "MID", "F": "FWD", "A": "FWD", "S": "FWD"}
+SOCCER_LOG_GAMES = 12        # player log = his club's last 12 matches in this competition
+SOCCER_WINDOW_DAYS = 4       # a "round" = matches within 4 days of the first one
+SOCCER_STATS = {
+    "GK": ["MIN", "SV", "YC"],
+    "DEF": ["MIN", "G", "A", "SH", "FC", "FS", "YC", "xG"],
+    "MID": ["MIN", "G", "A", "SH", "SOT", "KP", "FC", "FS", "YC", "xG", "xA"],
+    "FWD": ["MIN", "G", "A", "SH", "SOT", "KP", "FC", "FS", "YC", "xG", "xA"],
+}
+
+
+# ---------- club and player name matching ----------
+TEAM_STOP = {"fc", "sc", "vfb", "vfl", "tsg", "cf", "rcd", "cd", "ud", "rc", "ca", "afc", "ac", "as", "ss",
+             "sv", "fsv", "bsc", "1", "ogc", "osc", "sd", "us", "sk", "fk", "nk", "bk", "if", "aik"}
+TEAM_KEY_ALIASES = {
+    "rasenballsportleipzig": "rbleipzig", "leipzig": "rbleipzig",
+    "borussiamgladbach": "monchengladbach", "borussiamonchengladbach": "monchengladbach",
+    "mgladbach": "monchengladbach", "cologne": "koln", "einfrankfurt": "eintrachtfrankfurt",
+    "athbilbao": "athleticclub", "athleticbilbao": "athleticclub", "athmadrid": "atleticomadrid",
+    "espanol": "espanyol", "parissg": "parissaintgermain", "psg": "parissaintgermain",
+    "internazionale": "inter", "intermilan": "inter", "bayernmunchen": "bayernmunich",
+    "sportinglisbon": "sportingcp", "sporting": "sportingcp",
+}
+
+
+def team_key(name):
+    """'1. FC Köln' -> 'koln', 'Atlético Madrid' -> 'atleticomadrid', 'Ath Madrid' -> 'atleticomadrid'."""
+    plain = unicodedata.normalize("NFKD", name or "").lower().replace("-", " ").replace(".", " ")
+    tokens = ["".join(ch for ch in t if ch.isalnum() and not unicodedata.combining(ch)) for t in plain.split()]
+    key = "".join(t for t in tokens if t and t not in TEAM_STOP) or _norm(name)
+    key = TEAM_ALIASES.get(key, key)
+    return TEAM_KEY_ALIASES.get(key, key)
+
+
+def same_team(a, b):
+    ka, kb = team_key(a), team_key(b)
+    if not ka or not kb:
+        return False
+    if ka == kb:
+        return True
+    short, long = sorted((ka, kb), key=len)
+    return len(short) >= 4 and short in long  # 'betis' in 'realbetis', 'dortmund' in 'borussiadortmund'
+
+
+def find_team(name, candidates):
+    """Best matching club name from a list (exact key first, then 'contains')."""
+    exact = [c for c in candidates if team_key(c) == team_key(name)]
+    if exact:
+        return exact[0]
+    loose = [c for c in candidates if same_team(c, name)]
+    return min(loose, key=len) if loose else None
+
+
+def same_person(a, b):
+    """'Vinícius Júnior' == 'Vinicius Junior'; 'Kylian Mbappé' == 'K. Mbappe'."""
+    na, nb = _norm(a), _norm(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    pa, pb = (a or "").split(), (b or "").split()
+    if pa and pb and _norm(pa[-1]) == _norm(pb[-1]) and na[:1] == nb[:1] and len(_norm(pa[-1])) >= 3:
+        return True
+    short, long = sorted((na, nb), key=len)
+    return len(short) >= 6 and (long.startswith(short) or long.endswith(short))
+
+
+# ---------- ESPN (any competition) ----------
+def soccer_site(code):
+    return ESPN_SOCCER_BASE.format(code=code)
+
+
+@st.cache_data(ttl=24 * 3600)
+def soccer_teams(code):
+    data = get_json(f"{soccer_site(code)}/teams")
+    teams = []
+    for entry in data["sports"][0]["leagues"][0]["teams"]:
+        t = entry["team"]
+        name = t.get("displayName", "")
+        abbr = t.get("abbreviation") or (t.get("shortDisplayName") or name)[:3].upper()
+        teams.append({"id": str(t["id"]), "name": name, "abbr": abbr, "color": t.get("color") or "475569"})
+    return sorted(teams, key=lambda t: t["name"])
+
+
+def _soccer_roster(args):
+    code, team = args
+    try:
+        data = get_json(f"{soccer_site(code)}/teams/{team['id']}/roster")
+    except Exception:
+        return []
+    flat = []
+    for a in data.get("athletes", []):
+        if isinstance(a, dict) and "items" in a:
+            flat.extend(a["items"])
+        else:
+            flat.append(a)
+    rows = []
+    for a in flat:
+        if not isinstance(a, dict) or not a.get("id"):
+            continue
+        pos = a.get("position") or {}
+        letter = (pos.get("name") or pos.get("abbreviation") or "?")[:1].upper()
+        rows.append({"id": str(a["id"]), "name": a.get("displayName", ""), "pos": SOCCER_POS.get(letter, "MID"),
+                     "team_id": team["id"], "team_abbr": team["abbr"], "team_name": team["name"],
+                     "inj": next((i.get("status") or "" for i in (a.get("injuries") or []) if isinstance(i, dict)), "")})
+    return rows
+
+
+@st.cache_data(ttl=3 * 3600)
+def soccer_players(code, teams):
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        results = pool.map(_soccer_roster, [(code, t) for t in teams])
+    return sorted([p for r in results for p in r], key=lambda p: p["name"])
+
+
+@st.cache_data(ttl=30 * 60)
+def soccer_schedule(code, team_id):
+    """A club's matches in this competition (played and upcoming), oldest first."""
+    data = get_json(f"{soccer_site(code)}/teams/{team_id}/schedule")
+    out = []
+    for e in data.get("events", []):
+        comp = (e.get("competitions") or [{}])[0]
+        status = (comp.get("status") or e.get("status") or {}).get("type", {})
+        sides = {c.get("homeAway"): c for c in comp.get("competitors", [])}
+        h, a = sides.get("home") or {}, sides.get("away") or {}
+        ht, at = h.get("team") or {}, a.get("team") or {}
+        out.append({
+            "id": str(e.get("id", "")), "date": e.get("date", ""), "label": e.get("shortName", ""),
+            "done": bool(status.get("completed") or status.get("state") == "post"),
+            "home_id": str(ht.get("id", "")), "away_id": str(at.get("id", "")),
+            "home_name": ht.get("displayName", ""), "away_name": at.get("displayName", ""),
+            "home_abbr": ht.get("abbreviation", ""), "away_abbr": at.get("abbreviation", ""),
+            "home_score": _score(h), "away_score": _score(a),
+        })
+    return sorted(out, key=lambda g: g["date"])
+
+
+# ---------- Understat ----------
+@st.cache_resource
+def us_session():
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    try:
+        s.get(UNDERSTAT, timeout=15)  # Understat wants the homepage cookie first
+    except Exception:
+        pass
+    return s
+
+
+def us_get(path):
+    r = us_session().get(UNDERSTAT + path, headers={"X-Requested-With": "XMLHttpRequest"}, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def us_season():
+    today = dt.date.today()
+    return today.year if today.month >= 7 else today.year - 1
+
+
+@st.cache_data(ttl=6 * 3600)
+def us_league(slug, season):
+    d = us_get(f"/getLeagueData/{slug}/{season}")
+    return {"dates": d.get("dates", []), "players": d.get("players", []), "teams": d.get("teams", {})}
+
+
+@st.cache_data(ttl=24 * 3600)
+def us_match(match_id):
+    rosters = us_get(f"/getMatchData/{match_id}").get("rosters", {})
+    return [dict(p) for side in ("h", "a") for p in (rosters.get(side) or {}).values()]
+
+
+def _f(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+@st.cache_data(ttl=6 * 3600)
+def us_players(slug):
+    """Every player's season rates (per 90) in a big 5 league."""
+    try:
+        data = us_league(slug, us_season())
+    except Exception:
+        return []
+    out = []
+    for p in data["players"]:
+        mins = _f(p.get("time"))
+        per90 = (lambda k: _f(p.get(k)) / mins * 90) if mins else (lambda k: 0.0)
+        out.append({"name": p.get("player_name", ""), "team": p.get("team_title", ""), "pos": p.get("position", ""),
+                    "minutes": mins, "games": _f(p.get("games")), "xg90": per90("xG"), "xa90": per90("xA"),
+                    "sh90": per90("shots"), "kp90": per90("key_passes"), "yc90": per90("yellow_cards"),
+                    "goals": _f(p.get("goals"))})
+    return out
+
+
+@st.cache_data(ttl=6 * 3600)
+def us_team_xg(slug):
+    """Each club's xG for / against per game over its last 10 league matches, plus the league average."""
+    try:
+        teams = us_league(slug, us_season())["teams"]
+    except Exception:
+        return {}, 0
+    rows = {}
+    for t in teams.values():
+        hist = sorted(t.get("history", []), key=lambda h: h.get("date", ""), reverse=True)[:10]
+        if len(hist) >= 2:
+            rows[t.get("title", "")] = {"xg": sum(_f(h.get("xG")) for h in hist) / len(hist),
+                                        "xga": sum(_f(h.get("xGA")) for h in hist) / len(hist), "n": len(hist)}
+    avg = sum(r["xg"] for r in rows.values()) / len(rows) if rows else 0
+    return rows, avg
+
+
+def us_find_match(slug, home, away, when):
+    """Understat's id for a finished match (same two clubs, within a day)."""
+    try:
+        dates = us_league(slug, us_season())["dates"]
+    except Exception:
+        return None
+    for m in dates:
+        if not m.get("isResult"):
+            continue
+        d = _local((m.get("datetime") or "").replace(" ", "T") + "Z")
+        if d and when and abs((d.date() - when.date()).days) <= 1 \
+                and same_team((m.get("h") or {}).get("title", ""), home) and same_team((m.get("a") or {}).get("title", ""), away):
+            return m.get("id")
+    return None
+
+
+@st.cache_data(ttl=24 * 3600)
+def domestic_index():
+    """Which big 5 league each club plays in (for Champions / Europa League clubs)."""
+    idx = []
+    for code, slug, div in DOMESTIC:
+        try:
+            titles = [t.get("title", "") for t in us_league(slug, us_season())["teams"].values()]
+        except Exception:
+            titles = []
+        idx += [{"title": t, "code": code, "us": slug, "fd": div} for t in titles]
+    return idx
+
+
+def club_home_league(team_name, cfg):
+    """The domestic league whose numbers describe this club."""
+    if cfg.get("us"):
+        return {"code": cfg["espn"], "us": cfg["us"], "fd": cfg["fd"]}
+    idx = domestic_index()
+    title = find_team(team_name, [i["title"] for i in idx])
+    return next((i for i in idx if i["title"] == title), None) if title else None
+
+
+def club_form(team_name, cfg):
+    """(team row, league average, name in that table) from football-data for the club's domestic league."""
+    home = club_home_league(team_name, cfg)
+    if not home:
+        return None, None, None
+    try:
+        table, league = epl_team_table(home["fd"])
+    except Exception:
+        return None, None, None
+    key = find_team(team_name, list(table.keys()))
+    return (table[key], league, key) if key else (None, None, None)
+
+
+def club_xg(team_name, cfg):
+    home = club_home_league(team_name, cfg)
+    if not home:
+        return None
+    rows, avg = us_team_xg(home["us"])
+    title = find_team(team_name, list(rows.keys()))
+    return {**rows[title], "lg": avg, "us": home["us"], "title": title} if title and avg else None
+
+
+def soccer_projection(home_name, away_name, cfg, ref_row=None):
+    h, lh, _ = club_form(home_name, cfg)
+    a, la, _ = club_form(away_name, cfg)
+    if not h or not a:
+        return None
+    league = {k: (lh.get(k, 0) + la.get(k, 0)) / 2 for k in lh}  # two different leagues in Europe: average them
+    return epl_match_projection({"H": h, "A": a}, league, "H", "A", ref_row)
+
+
+def club_threats(team_name, opp_name, cfg, roster, limit=None):
+    """A club's attackers: Understat xG per 90 x how many xG the opponent concedes vs its league average."""
+    home = club_home_league(team_name, cfg)
+    opp = club_xg(opp_name, cfg)
+    if not home or not opp or not opp["lg"]:
+        return []
+    factor = opp["xga"] / opp["lg"]
+    title = find_team(team_name, list({p["team"].split(",")[-1] for p in us_players(home["us"])}))
+    out_names = [p["name"] for p in roster if status_class(p.get("inj", "")) == "s-out"]
+    maybe = [p["name"] for p in roster if p.get("inj") and status_class(p["inj"]) not in ("s-out", "s-ok")]
+    rows = []
+    for p in us_players(home["us"]):
+        if not title or not same_team(p["team"].split(",")[-1], title) or p["minutes"] < EPL_MIN_MINUTES:
+            continue
+        if any(same_person(p["name"], n) for n in out_names):
+            continue
+        rows.append({**p, "name": roster_name(p["name"], roster), "factor": factor, "proj_xg": p["xg90"] * factor,
+                     "opp_xga": opp["xga"], "lg_xg": opp["lg"],
+                     "questionable": any(same_person(p["name"], n) for n in maybe)})
+    rows.sort(key=lambda r: r["proj_xg"], reverse=True)
+    return rows[:limit] if limit else rows
+
+
+def short_name(full):
+    """'Vinícius Júnior' -> 'Vinícius', 'Harry Kane' -> 'Kane', 'Pedri' -> 'Pedri'."""
+    parts = (full or "").split()
+    if not parts:
+        return ""
+    if len(parts) > 1 and _norm(parts[-1]) in ("junior", "jr", "sr", "ii", "iii", "iv", "filho", "neto", "sobrinho"):
+        return parts[-2] if len(parts) > 2 else parts[0]
+    return parts[-1]
+
+
+def roster_name(name, roster):
+    """Use ESPN's spelling (with accents) when we can match the Understat name to the roster."""
+    return next((p["name"] for p in roster if same_person(p["name"], name)), name)
+
+
+def soccer_availability(roster):
+    return [{"player": p["name"], "id": p["id"], "status": p["inj"], "note": ""} for p in roster if p.get("inj")]
+
+
+# ---------- player match log ----------
+def soccer_player_log(cfg, player, schedule):
+    """One row per match he played: ESPN shots/fouls/cards + Understat xG/xA/key passes/minutes."""
+    code = cfg["espn"]
+    done = [g for g in schedule if g["done"]][-SOCCER_LOG_GAMES:]
+
+    def one(g):
+        try:
+            m = espn_match(g["id"], code)
+        except Exception:
+            return None
+        mine = next((p for p in m["players"]
+                     if same_person(p["name"], player["name"]) and same_team(p.get("club_name", ""), player["team_name"])), None)
+        if not mine:
+            return None
+        home = g["home_id"] == player["team_id"]
+        row = {"Date": g["date"][:10], "Opp": g["away_abbr"] if home else g["home_abbr"],
+               "opp_id": g["away_id"] if home else g["home_id"], "H/A": "Home" if home else "Away",
+               "Score": f'{_fmt_score(g["home_score"])}-{_fmt_score(g["away_score"])}',
+               "Started": "Yes" if mine.get("starter") else "Sub",
+               "G": mine.get("ESPN G"), "A": mine.get("ESPN A"), "SH": mine.get("SH"), "SOT": mine.get("SOT"),
+               "FC": mine.get("FC"), "FS": mine.get("FS"), "YC": mine.get("ESPN YC"), "SV": mine.get("ESPN SV")}
+        if cfg.get("us"):  # domestic big 5: add Understat's xG, xA, key passes and minutes
+            try:
+                us_id = us_find_match(cfg["us"], g["home_name"], g["away_name"], _local(g["date"]))
+                us_row = next((p for p in us_match(us_id) if same_person(p.get("player", ""), player["name"])), None) if us_id else None
+            except Exception:
+                us_row = None
+            if us_row:
+                row.update({"MIN": _f(us_row.get("time")), "xG": _f(us_row.get("xG")), "xA": _f(us_row.get("xA")),
+                            "KP": _f(us_row.get("key_passes"))})
+        return row
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        rows = [r for r in pool.map(one, done) if r]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    for c in df.columns:
+        if c not in ("Date", "Opp", "opp_id", "H/A", "Score", "Started"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.sort_values("Date", ascending=False).reset_index(drop=True)
+
+
+def _fmt_score(x):
+    return "" if x is None else f"{x:.0f}"
+
+
+# ---------- player lookup page ----------
+def render_soccer_player(league_name):
+    cfg = SOCCER_LEAGUES[league_name]
+    code, key = cfg["espn"], cfg["key"]
+    try:
+        teams = soccer_teams(code)
+        players = soccer_players(code, teams)
+    except Exception as e:
+        st.error(f"Couldn't reach ESPN right now. Try refreshing in a minute. ({e})")
+        return
+    team_by_id = {t["id"]: t for t in teams}
+
+    c1, c2 = st.columns(2)
+    with c1:
+        player = st.selectbox("Player", players, index=None, key=f"{key}_player", placeholder="Start typing a name",
+                              format_func=lambda p: f'{p["name"]} ({p["team_abbr"]}, {p["pos"]})')
+    schedule, nxt = [], None
+    if player:
+        try:
+            schedule = soccer_schedule(code, player["team_id"])
+        except Exception:
+            schedule = []
+        nxt = next((g for g in schedule if not g["done"]), None)
+    with c2:
+        default = None
+        if nxt:
+            opp_id = nxt["away_id"] if nxt["home_id"] == player["team_id"] else nxt["home_id"]
+            default = next((i for i, t in enumerate(teams) if t["id"] == opp_id), None)
+        opp = st.selectbox("Opponent", teams, index=default, placeholder="Pick a team", format_func=lambda t: t["name"],
+                           key=f'{key}_opp_{player["id"] if player else "none"}')
+    if not player or not opp:
+        st.markdown('<div class="muted">Pick a player and an opponent to get started.</div>', unsafe_allow_html=True)
+        return
+    if opp["id"] == player["team_id"]:
+        st.warning("That's the player's own team. Pick a different opponent.")
+        return
+    my_team = team_by_id.get(player["team_id"], {"id": player["team_id"], "name": player["team_name"],
+                                                  "abbr": player["team_abbr"], "color": "475569"})
+
+    with st.spinner("Reading his recent match pages (first time takes a few seconds)..."):
+        log = soccer_player_log(cfg, player, schedule)
+    vs_opp = log[log["opp_id"] == opp["id"]] if not log.empty else log
+    hero(player, my_team, opp, len(vs_opp), {"seasons_back": 1},
+         sub=f"{len(vs_opp)} meetings in his last {SOCCER_LOG_GAMES} {league_name} matches")
+    fixture = nxt if nxt and opp["id"] in (nxt["home_id"], nxt["away_id"]) else None
+    if fixture:
+        when = _local(fixture["date"])
+        when_txt = f'{when.strftime("%a %b")} {when.day}, {when.strftime("%I:%M %p").lstrip("0")} ET' if when else ""
+        st.markdown(f'<span class="pill-game">🗓️ Next match: <b>{html.escape(fixture["label"])}</b> · {when_txt}</span>',
+                    unsafe_allow_html=True)
+
+    # ----- insights -----
+    lines, grade = [], None
+    o, lg, _ = club_form(opp["name"], cfg)
+    oxg = club_xg(opp["name"], cfg)
+    attacker = player["pos"] in ("MID", "FWD")
+    if oxg:
+        factor = oxg["xga"] / oxg["lg"] if attacker else oxg["xg"] / oxg["lg"]
+        e = factor - 1 if attacker else 1 - factor
+        if attacker:
+            grade = ("g-good", "GOOD MATCHUP") if e >= EDGE else ("g-bad", "TOUGH MATCHUP") if e <= -EDGE else ("g-mid", "NEUTRAL")
+            lines.append(f'{html.escape(opp["abbr"])} concede <b>{oxg["xga"]:.2f} xG</b> per game '
+                         f'(their league avg {oxg["lg"]:.2f}), {vs_avg(factor)}.')
+        else:
+            grade = ("g-good", "CLEAN SHEET LOOK") if e >= EDGE else ("g-bad", "TOUGH MATCHUP") if e <= -EDGE else ("g-mid", "NEUTRAL")
+            lines.append(f'{html.escape(opp["abbr"])} create <b>{oxg["xg"]:.2f} xG</b> per game '
+                         f'(their league avg {oxg["lg"]:.2f}), {vs_avg(factor)}.')
+    elif o and lg:
+        lines.append(f'{html.escape(opp["abbr"])} concede <b>{o["goals_against"]:.1f} goals</b> per game '
+                     f'(league avg {lg["goals_for"]:.1f}).')
+    if attacker and o and lg and not log.empty and "SOT" in log and log["SOT"].notna().sum() >= 3:
+        sot = log["SOT"].dropna()
+        lines.append(f'🎯 {html.escape(opp["abbr"])} allow <b>{o["sot_against"]:.1f} shots on target</b> per game '
+                     f'(league avg {lg["sot_for"]:.1f}). {html.escape(short_name(player["name"]))} averages '
+                     f'<b>{sot.mean():.1f}</b> on target and has hit 1+ in {int((sot >= 1).sum())} of {len(sot)} matches.')
+    if not log.empty and {"xG", "xA", "MIN"} <= set(log.columns) and log["MIN"].notna().sum() >= 3:
+        lm = log.dropna(subset=["MIN"])
+        recent = lm.head(5)
+        r90 = (recent["xG"].sum() + recent["xA"].sum()) / max(recent["MIN"].sum(), 1) * 90
+        s90 = (lm["xG"].sum() + lm["xA"].sum()) / max(lm["MIN"].sum(), 1) * 90
+        if s90 > 0 and abs(r90 - s90) / s90 >= EDGE:
+            lines.append(f'Form {"rising 📈" if r90 > s90 else "cooling 📉"}: <b>{r90:.2f}</b> xG+xA per 90 over his last '
+                         f'{len(recent)} vs <b>{s90:.2f}</b> across his last {len(lm)}.')
+    ref_name = ""
+    proj = None
+    if fixture:
+        try:
+            ref_name = espn_match(fixture["id"], code)["referee"]
+        except Exception:
+            ref_name = ""
+        proj = soccer_projection(fixture["home_name"], fixture["away_name"], cfg)
+    if proj:
+        cards_word = ("🟨 Card heavy" if proj["total_yellows"] >= proj["league_yellows"] * (1 + EDGE)
+                      else "Calm" if proj["total_yellows"] <= proj["league_yellows"] * (1 - EDGE) else "Normal")
+        ref_txt = f' Referee: <b>{html.escape(ref_name)}</b>.' if ref_name else ""
+        yc = log["YC"].dropna() if not log.empty and "YC" in log else pd.Series(dtype=float)
+        mine = f' He\'s been booked in {int((yc > 0).sum())} of his last {len(yc)}.' if len(yc) else ""
+        lines.append(f'{cards_word} match: projected <b>{proj["total_yellows"]:.1f} yellows</b> '
+                     f'(avg {proj["league_yellows"]:.1f}).{ref_txt}{mine}')
+    star_html = ""
+    if fixture:
+        cands = []
+        for side, other in (("home", "away"), ("away", "home")):
+            roster = [p for p in players if p["team_id"] == fixture[f"{side}_id"]]
+            for t in club_threats(fixture[f"{side}_name"], fixture[f"{other}_name"], cfg, roster, limit=1):
+                cands.append({**t, "abbr": fixture[f"{side}_abbr"], "opp_abbr": fixture[f"{other}_abbr"]})
+        star = max(cands, key=lambda r: r["proj_xg"], default=None)
+        if star and star["factor"] >= 1 + EDGE:
+            star_html = (f'<div class="star"><div class="star-label">⭐ Player to watch</div>'
+                         f'<div class="star-name">{html.escape(star["name"])} <span>{html.escape(star["abbr"])}'
+                         f'{" · Q" if star["questionable"] else ""}</span></div>'
+                         f'<div class="ins-line">Best goal threat in this match: {star["xg90"]:.2f} xG per 90 against a '
+                         f'{html.escape(star["opp_abbr"])} defense conceding {star["opp_xga"]:.2f} xG per game '
+                         f'(avg {star["lg_xg"]:.2f}), <span class="edge">{vs_avg(star["factor"])}</span>.</div></div>')
+    if lines or star_html:
+        grade_html = f'<span class="grade {grade[0]}">{grade[1]}</span>' if grade else ""
+        body = "".join(f'<div class="ins-line">{l}</div>' for l in lines)
+        st.markdown(f'<div class="insights"><div class="insights-title">💡 Matchup insights {grade_html}</div>{body}{star_html}'
+                    f'<div class="muted" style="margin-top:.7rem">Team numbers from each club\'s last 10 domestic league '
+                    f'matches. Trends, not guarantees.</div></div>', unsafe_allow_html=True)
+
+    if proj:
+        section("Match outlook", "projected from both clubs' recent league matches")
+        h_ab, a_ab = fixture["home_abbr"], fixture["away_abbr"]
+        cards = [("Goals", f'{sum(proj["goals"]):.1f}', f'{h_ab} {proj["goals"][0]:.1f} · {a_ab} {proj["goals"][1]:.1f}'),
+                 ("Shots", f'{sum(proj["shots"]):.1f}', f'{h_ab} {proj["shots"][0]:.1f} · {a_ab} {proj["shots"][1]:.1f}'),
+                 ("Corners", f'{sum(proj["corners"]):.1f}', f'avg {proj["league_corners"]:.1f}'),
+                 ("Yellow cards", f'{proj["total_yellows"]:.1f}', f'avg {proj["league_yellows"]:.1f}'),
+                 ("Fouls", f'{sum(proj["fouls"]):.1f}', f'{h_ab} {proj["fouls"][0]:.1f} · {a_ab} {proj["fouls"][1]:.1f}')]
+        st.markdown('<div class="cards">' + "".join(
+            f'<div class="card"><div class="card-label">{l}</div><div class="card-value">{v}</div><div class="muted">{n}</div></div>'
+            for l, v, n in cards) + '</div>', unsafe_allow_html=True)
+
+    if log.empty:
+        st.info("No match stats found for him in this competition yet.")
+    else:
+        stats = [s for s in SOCCER_STATS.get(player["pos"], SOCCER_STATS["MID"]) if s in log.columns and log[s].notna().any()]
+        section("Recent numbers", f"per game over his last {len(log)} {league_name} appearances")
+        cards = []
+        for s in stats:
+            avg = log[s].mean()
+            cards.append(f'<div class="card"><div class="card-label">{s} per game</div>'
+                         f'<div class="card-value">{avg:.0f}</div></div>' if s == "MIN" else
+                         f'<div class="card"><div class="card-label">{s} per game</div><div class="card-value">{avg:.2f}</div></div>')
+        st.markdown(f'<div class="cards">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+        section("Line checker", "how often he went over a number")
+        first = [x for x in ("SOT", "SH") if x in stats] if attacker else []
+        line_stats = first + [x for x in stats if x != "MIN" and x not in first] + (["MIN"] if "MIN" in stats else [])
+        l1, l2 = st.columns(2)
+        line_stat = l1.selectbox("Stat", line_stats, key=f"{key}_line_stat")
+        avg = log[line_stat].head(10).mean()
+        suggested = 0.5
+        if pd.notna(avg) and avg >= 1 and line_stat not in ("G", "A", "YC"):
+            suggested = float(int(avg)) - 0.5 if avg - int(avg) < 0.5 else float(int(avg)) + 0.5
+            if line_stat in ("MIN",):
+                suggested = float(int(avg)) + 0.5
+        line_value = l2.number_input("Line", min_value=0.0, value=suggested, step=0.5,
+                                     key=f'{key}_line_{player["id"]}_{line_stat}')
+        st.markdown('<div class="cards">'
+                    + hit_card(f"vs {opp['abbr']}", vs_opp[line_stat] if not vs_opp.empty else log[line_stat].iloc[0:0], line_value)
+                    + hit_card("Last 5", log.head(5)[line_stat], line_value)
+                    + hit_card(f"Last {len(log)}", log[line_stat], line_value)
+                    + "</div>", unsafe_allow_html=True)
+
+        section("Match log", f"his last {len(log)} {league_name} matches")
+        cols = ["Date", "Opp", "H/A", "Score", "Started"] + stats
+        st.dataframe(log[[c for c in cols if c in log.columns]], hide_index=True, width="stretch")
+
+    section("Availability", "from ESPN's team rosters")
+    a1, a2 = st.columns(2)
+    for col, team in ((a1, my_team), (a2, opp)):
+        with col:
+            injury_list(team, soccer_availability([p for p in players if p["team_id"] == team["id"]]))
+
+
+# ---------- slate page ----------
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def soccer_round(code, team_ids):
+    """The next round: every club's next match, grouped to the first few days."""
+    def nxt(tid):
+        try:
+            return next((g for g in soccer_schedule(code, tid) if not g["done"]), None)
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        games = {g["id"]: g for g in pool.map(nxt, team_ids) if g and _local(g["date"])}
+    ordered = sorted(games.values(), key=lambda g: g["date"])
+    if not ordered:
+        return []
+    first = _local(ordered[0]["date"])
+    return [g for g in ordered if (_local(g["date"]) - first).days < SOCCER_WINDOW_DAYS]
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def soccer_referee_table(code, team_ids):
+    """Referee stats built from this season's ESPN match pages in this competition."""
+    events = set()
+    for tid in team_ids:
+        try:
+            events |= {g["id"] for g in soccer_schedule(code, tid) if g["done"]}
+        except Exception:
+            pass
+
+    def one(eid):
+        try:
+            m = espn_match(eid, code)
+        except Exception:
+            return None
+        if not m["referee"]:
+            return None
+        pl = pd.DataFrame(m["players"])
+        tot = lambda c: float(pl[c].fillna(0).sum()) if c in pl else 0.0
+        return {"Referee": m["referee"], "yellows": tot("ESPN YC"), "reds": tot("ESPN RC"), "fouls": tot("FC")}
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        rows = [r for r in pool.map(one, sorted(events)) if r]
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    g = df.groupby("Referee")
+    out = pd.DataFrame({"Matches": g.size(), "Yellows/game": g["yellows"].mean(),
+                        "Reds/game": g["reds"].mean(), "Fouls/game": g["fouls"].mean()})
+    return out[out["Matches"] >= 2].sort_values("Yellows/game", ascending=False).round(2)
+
+
+def render_soccer_slate(league_name):
+    cfg = SOCCER_LEAGUES[league_name]
+    code, key = cfg["espn"], cfg["key"]
+    try:
+        teams = soccer_teams(code)
+        players = soccer_players(code, teams)
+    except Exception as e:
+        st.error(f"Couldn't reach ESPN right now. Try refreshing in a minute. ({e})")
+        return
+    team_ids = tuple(t["id"] for t in teams)
+    with st.spinner("Loading the fixtures..."):
+        games = soccer_round(code, team_ids)
+    if not games:
+        st.markdown('<div class="muted">No upcoming matches found.</div>', unsafe_allow_html=True)
+        return
+    first = _local(games[0]["date"])
+    section(f'{league_name} · {first.strftime("%b")} {first.day}', f"{len(games)} matches")
+
+    def roster(tid):
+        return [p for p in players if p["team_id"] == tid]
+
+    # goal threats
+    with st.spinner("Ranking goal threats..."):
+        threats = []
+        for g in games:
+            for side, other in (("home", "away"), ("away", "home")):
+                for t in club_threats(g[f"{side}_name"], g[f"{other}_name"], cfg, roster(g[f"{side}_id"]), limit=3):
+                    threats.append({**t, "abbr": g[f"{side}_abbr"], "opp_abbr": g[f"{other}_abbr"]})
+    threats = sorted(threats, key=lambda r: r["proj_xg"], reverse=True)[:10]
+    section("Top goal threats", "xG per 90 × how much xG the opponent concedes")
+    q_tag = ' <span class="status s-q">Q</span>'
+    st.markdown("".join(
+        f'<div class="sneaky"><div><b>{i}. {html.escape(t["name"])}</b> '
+        f'<span class="muted">{html.escape(t["abbr"])} · vs {html.escape(t["opp_abbr"])}</span>'
+        + (q_tag if t["questionable"] else "") + '<br>'
+        + f'<span class="muted">{t["xg90"]:.2f} xG + {t["xa90"]:.2f} xA per 90 · {html.escape(t["opp_abbr"])} concede '
+        f'{t["opp_xga"]:.2f} xG per game (avg {t["lg_xg"]:.2f}), {vs_avg(t["factor"])}</span></div>'
+        + edge_pill(f'{t["proj_xg"]:.2f}', "proj xG") + '</div>' for i, t in enumerate(threats, 1))
+        or '<div class="muted">Not enough data yet.</div>', unsafe_allow_html=True)
+
+    # match cards + card environments
+    def card_data(g):
+        try:
+            ref = espn_match(g["id"], code)["referee"]
+        except Exception:
+            ref = ""
+        return g["id"], soccer_projection(g["home_name"], g["away_name"], cfg), ref
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        info = {gid: (pr, ref) for gid, pr, ref in pool.map(card_data, games)}
+
+    # card watch (Understat yellows per 90 x how card heavy the match projects)
+    section("Card watch", "players who pick up yellows, in the most card heavy matches")
+    card_rows = []
+    for g in games:
+        pr = info[g["id"]][0]
+        if not pr or not pr["league_yellows"]:
+            continue
+        env = pr["total_yellows"] / pr["league_yellows"]
+        for side, other in (("home", "away"), ("away", "home")):
+            home = club_home_league(g[f"{side}_name"], cfg)
+            if not home:
+                continue
+            outs = [p["name"] for p in roster(g[f"{side}_id"]) if status_class(p.get("inj", "")) == "s-out"]
+            for p in us_players(home["us"]):
+                if p["minutes"] < EPL_MIN_MINUTES or not same_team(p["team"].split(",")[-1], g[f"{side}_name"]):
+                    continue
+                if any(same_person(p["name"], n) for n in outs):
+                    continue
+                card_rows.append({**p, "name": roster_name(p["name"], roster(g[f"{side}_id"])),
+                                  "score": p["yc90"] * env, "abbr": g[f"{side}_abbr"], "opp_abbr": g[f"{other}_abbr"],
+                                  "proj_y": pr["total_yellows"], "lg_y": pr["league_yellows"]})
+    card_rows = sorted(card_rows, key=lambda r: r["score"], reverse=True)[:8]
+    st.markdown("".join(
+        f'<div class="sneaky"><div><b>{i}. {html.escape(r["name"])}</b> '
+        f'<span class="muted">{html.escape(r["abbr"])} · vs {html.escape(r["opp_abbr"])}</span><br>'
+        f'<span class="muted">{r["yc90"]:.2f} yellows per 90 · match projects {r["proj_y"]:.1f} yellows (avg {r["lg_y"]:.1f})</span></div>'
+        + edge_pill(f'{1 - math.exp(-r["score"]):.0%}', "card chance") + '</div>' for i, r in enumerate(card_rows, 1))
+        or '<div class="muted">Not enough data yet.</div>', unsafe_allow_html=True)
+
+    # shots on target leaders (reads match pages, so behind a button)
+    section("Shots on target leaders", "shots on target per game × how many the opponent allows")
+    go_key = f"{key}_sot_go"
+    if not st.session_state.get(go_key):
+        if st.button("🎯 Load shots on target leaders", key=f"{key}_sot_btn", type="primary"):
+            st.session_state[go_key] = True
+        st.caption("Reads each club's last 5 match pages, so the first load takes a minute. Then it's saved for hours.")
+    if st.session_state.get(go_key):
+        shooters = []
+        with st.spinner("Reading match pages..."):
+            for g in games:
+                for side, other in (("home", "away"), ("away", "home")):
+                    tid = g[f"{side}_id"]
+                    try:
+                        recent = [x["id"] for x in soccer_schedule(code, tid) if x["done"]][-5:]
+                    except Exception:
+                        recent = []
+                    rows = []
+                    for eid in recent:
+                        try:
+                            rows += [p for p in espn_match(eid, code)["players"] if same_team(p.get("club_name", ""), g[f"{side}_name"])]
+                        except Exception:
+                            pass
+                    if not rows:
+                        continue
+                    df = pd.DataFrame(rows)
+                    for c in ("SH", "SOT"):
+                        if c not in df:
+                            df[c] = 0
+                    o, lg, _ = club_form(g[f"{other}_name"], cfg)
+                    factor = o["sot_against"] / lg["sot_for"] if o and lg and lg.get("sot_for") else 1
+                    outs = [p["name"] for p in roster(tid) if status_class(p.get("inj", "")) == "s-out"]
+                    for name, grp in df.groupby("name"):
+                        if len(grp) < 3 or grp["starter"].sum() < 2 or any(same_person(name, n) for n in outs):
+                            continue
+                        sot = grp["SOT"].fillna(0).mean()
+                        if sot:
+                            shooters.append({"name": name, "abbr": g[f"{side}_abbr"], "opp_abbr": g[f"{other}_abbr"],
+                                             "sot": sot, "sh": grp["SH"].fillna(0).mean(), "apps": len(grp), "factor": factor,
+                                             "opp_sot": o["sot_against"] if o else None, "lg_sot": lg["sot_for"] if lg else None})
+        shooters = sorted(shooters, key=lambda r: r["sot"] * r["factor"], reverse=True)[:10]
+        st.markdown("".join(
+            f'<div class="sneaky"><div><b>{i}. {html.escape(r["name"])}</b> '
+            f'<span class="muted">{html.escape(r["abbr"])} · vs {html.escape(r["opp_abbr"])}</span><br>'
+            f'<span class="muted">{r["sot"]:.1f} on target, {r["sh"]:.1f} shots per game (last {r["apps"]})'
+            + (f' · {html.escape(r["opp_abbr"])} allow {r["opp_sot"]:.1f} on target per game (avg {r["lg_sot"]:.1f}), '
+               f'{vs_avg(r["factor"])}' if r["opp_sot"] else "") + '</span></div>'
+            + edge_pill(f'{r["sot"] * r["factor"]:.1f}', "proj SOT") + '</div>' for i, r in enumerate(shooters, 1))
+            or '<div class="muted">No shooting data found yet.</div>', unsafe_allow_html=True)
+
+    # match cards
+    section("Matches", "projected goals, corners and cards")
+    cards = []
+    for g in games:
+        pr, ref = info[g["id"]]
+        when = _local(g["date"])
+        when_txt = f'{when.strftime("%a")} {when.strftime("%I:%M %p").lstrip("0")} ET' if when else ""
+        meta, badge = [], ""
+        if pr:
+            meta += [f'Goals {sum(pr["goals"]):.1f} ({g["home_abbr"]} {pr["goals"][0]:.1f} · {g["away_abbr"]} {pr["goals"][1]:.1f})',
+                     f'Corners {sum(pr["corners"]):.1f} · Yellows {pr["total_yellows"]:.1f}']
+            if pr["total_yellows"] >= pr["league_yellows"] * (1 + EDGE):
+                badge = '<span class="grade g-bad">CARD HEAVY</span>'
+            elif sum(pr["goals"]) >= pr["league_goals"] * (1 + EDGE):
+                badge = '<span class="grade g-good">GOALS EXPECTED</span>'
+        if ref:
+            meta.append(f"Ref: {html.escape(ref)}")
+        color = next((t["color"] for t in teams if t["id"] == g["home_id"]), "475569")
+        cards.append(f'<div class="game-card" style="border-top:5px solid #{color}">'
+                     f'<div class="game-teams">{html.escape(g["home_abbr"])} <span>vs</span> {html.escape(g["away_abbr"])}</div>'
+                     f'<div class="muted">{when_txt}</div>{badge}<div class="game-meta">{"<br>".join(meta)}</div></div>')
+    st.markdown(f'<div class="game-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+    # referees
+    section("Referees", f"this season's {league_name} matches · sorted by yellows per game")
+    ref_key = f"{key}_ref_go"
+    if not st.session_state.get(ref_key):
+        if st.button("🟨 Load referee stats", key=f"{key}_ref_btn"):
+            st.session_state[ref_key] = True
+        st.caption("Builds the table from every match page this season, so the first load takes a minute or two.")
+    if st.session_state.get(ref_key):
+        with st.spinner("Reading this season's match pages..."):
+            refs = soccer_referee_table(code, team_ids)
+        if refs.empty:
+            st.markdown('<div class="muted">No referee data found yet.</div>', unsafe_allow_html=True)
+        else:
+            st.dataframe(refs, width="stretch")
+
+
+def render_soccer(league_name):
+    if league_name == "Premier League":
+        render_epl()
+        return
+    key = SOCCER_LEAGUES[league_name]["key"]
+    views = ["🔎 Player lookup", "📋 Slate"]
+    view = st.segmented_control("View", views, default=views[0], label_visibility="collapsed",
+                                key=f"{key}_view") or views[0]
+    if view == views[1]:
+        render_soccer_slate(league_name)
+    else:
+        render_soccer_player(league_name)
+
+
 # ---------- THE WEBSITE ----------
-SPORT_NAMES = list(SPORTS.keys()) + [EPL_KEY]
-chosen = st.session_state.get("sport") or SPORT_NAMES[0]   # which sport is picked decides the theme
-theme = "epl" if chosen == EPL_KEY else SPORTS[chosen]["key"]
+SPORT_NAMES = list(SPORTS.keys()) + [SOCCER_KEY]
+chosen = st.session_state.get("sport") or SPORT_NAMES[0]   # which sport (and league) is picked decides the theme
+if chosen == SOCCER_KEY:
+    theme = SOCCER_LEAGUES[st.session_state.get("soccer_league") or "Premier League"]["key"]
+else:
+    theme = SPORTS[chosen]["key"]
 inject_css(theme)
 banner(theme)
 
 sport = st.segmented_control("Sport", SPORT_NAMES, default=SPORT_NAMES[0],
                              label_visibility="collapsed", key="sport")
-if (sport or SPORT_NAMES[0]) == EPL_KEY:
-    render_epl()
+if (sport or SPORT_NAMES[0]) == SOCCER_KEY:
+    league = st.segmented_control("League", list(SOCCER_LEAGUES), default="Premier League",
+                                  label_visibility="collapsed", key="soccer_league") or "Premier League"
+    render_soccer(league)
 else:
     render_sport(sport or SPORT_NAMES[0])
 
-st.markdown('<div class="muted" style="margin-top:2rem">Data: ESPN public feeds, Fantasy Premier League, football-data.co.uk. '
+st.markdown('<div class="muted" style="margin-top:2rem">Data: ESPN public feeds, Fantasy Premier League, Understat, football-data.co.uk. '
             'Game logs refresh every 3 hours. For fun and research only.</div>', unsafe_allow_html=True)
