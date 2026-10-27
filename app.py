@@ -14,6 +14,7 @@
 import datetime as dt
 import html
 from concurrent.futures import ThreadPoolExecutor
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -178,6 +179,12 @@ html, body, [class*="css"], .stMarkdown, .stDataFrame { font-family: 'Inter', sa
   border-radius:10px; padding:.55rem .8rem; margin-top:.4rem; font-size:.9rem; }
 .sneaky b { color:#0F172A; }
 .edge { font-weight:800; color:#15803D; white-space:nowrap; }
+.game-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:.8rem; }
+.game-card { background:#fff; border:1px solid #E2E8F0; border-radius:12px; padding:.8rem 1rem; box-shadow:0 2px 8px rgba(15,23,42,.06); }
+.game-teams { font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:1.7rem; color:#0F172A; }
+.game-teams span { color:#94A3B8; font-size:1.1rem; }
+.game-meta { color:#334155; font-size:.85rem; margin-top:.4rem; line-height:1.5; }
+.game-star { margin-top:.5rem; background:#FEF3C7; color:#92400E; font-weight:700; font-size:.82rem; border-radius:8px; padding:.3rem .5rem; }
 .star { background:linear-gradient(135deg,#FFFBEB,#FEF3C7); border:1px solid #FCD34D; border-radius:12px;
   padding:.7rem .9rem; margin:.6rem 0 .3rem; }
 .star-label { font-size:.75rem; font-weight:800; color:#B45309; letter-spacing:.08em; text-transform:uppercase; }
@@ -306,6 +313,7 @@ def load_gamelog(web, player_id, season, season_text, use_names):
                 info = game_info.get(game_id, {})
                 opp = info.get("opponent") or {}
                 row = {
+                    "event_id": game_id,
                     "Date": (info.get("gameDate") or "")[:10],
                     "Season": season_text,
                     "Type": "Playoffs" if "post" in type_name else "Regular",
@@ -323,7 +331,7 @@ def clean_numbers(df, sport_key):
     """ESPN sends stats as text. Turn them into numbers and add combo stats."""
     df = df.copy()
     for col in df.columns:
-        if col in META_COLS or col == "opp_id":
+        if col in META_COLS or col in ("opp_id", "event_id"):
             continue
         converted = pd.to_numeric(df[col], errors="coerce")
         if converted.notna().sum() >= 0.5 * df[col].notna().sum():  # mostly numbers? keep as numbers
@@ -335,6 +343,9 @@ def clean_numbers(df, sport_key):
     if sport_key == "nba":
         if "3PT" in df:  # "4-9" means 4 made out of 9
             df["3PM"] = pd.to_numeric(df["3PT"].astype(str).str.split("-").str[0], errors="coerce")
+            df["3PA"] = pd.to_numeric(df["3PT"].astype(str).str.split("-").str[1], errors="coerce")
+        if "FG" in df:
+            df["FGA"] = pd.to_numeric(df["FG"].astype(str).str.split("-").str[1], errors="coerce")
         if has("PTS", "REB", "AST"):
             df["PRA"] = df["PTS"] + df["REB"] + df["AST"]
     if sport_key == "nfl":
@@ -395,6 +406,9 @@ def load_next_game(site, team_id):
         if team_id not in sides.values():
             continue
         upcoming.append({
+            "id": str(event.get("id", "")),
+            "home": sides.get("home"),
+            "away": sides.get("away"),
             "date": event.get("date", ""),
             "opp_id": sides.get("away") if sides.get("home") == team_id else sides.get("home"),
             "label": event.get("shortName", ""),
@@ -432,13 +446,26 @@ BOX_KEYS = {**NAME_MAP,
             "completions/passingAttempts": "C/ATT",
             "minutes": "MIN", "points": "PTS", "rebounds": "REB", "totalRebounds": "REB",
             "assists": "AST", "steals": "STL", "blocks": "BLK", "turnovers": "TO",
-            "threePointFieldGoalsMade-threePointFieldGoalsAttempted": "3PT"}
+            "threePointFieldGoalsMade-threePointFieldGoalsAttempted": "3PT",
+            "fieldGoalsMade-fieldGoalsAttempted": "FG"}
 BOX_LABELS = {
     "passing": {"C/ATT": "C/ATT", "YDS": "PASS YDS", "TD": "PASS TD", "INT": "INT"},
     "rushing": {"CAR": "CAR", "YDS": "RUSH YDS", "TD": "RUSH TD"},
     "receiving": {"REC": "REC", "YDS": "REC YDS", "TD": "REC TD", "TGTS": "TGT", "TGT": "TGT"},
-    "": {"MIN": "MIN", "PTS": "PTS", "REB": "REB", "AST": "AST", "STL": "STL", "BLK": "BLK", "TO": "TO", "3PT": "3PT"},
+    "": {"MIN": "MIN", "PTS": "PTS", "REB": "REB", "AST": "AST", "STL": "STL", "BLK": "BLK", "TO": "TO", "3PT": "3PT",
+         "FG": "FG"},
 }
+
+
+def _score(competitor):
+    """ESPN sends scores as a number, text, or {"value": 27}."""
+    sc = competitor.get("score")
+    if isinstance(sc, dict):
+        sc = sc.get("value", sc.get("displayValue"))
+    try:
+        return float(sc)
+    except (TypeError, ValueError):
+        return None
 
 
 @st.cache_data(ttl=6 * 3600)
@@ -451,9 +478,12 @@ def load_completed_games(site, team_id, season):
         status = (comp.get("status") or event.get("status") or {}).get("type", {})
         if not (status.get("completed") or status.get("state") == "post"):
             continue
-        sides = [str((c.get("team") or {}).get("id", "")) for c in comp.get("competitors", [])]
+        comps = comp.get("competitors", [])
+        sides = [str((c.get("team") or {}).get("id", "")) for c in comps]
         other = next((s for s in sides if s != team_id), "")
-        games.append({"id": str(event.get("id", "")), "date": (event.get("date") or "")[:10], "other_id": other})
+        scores = {str((c.get("team") or {}).get("id", "")): _score(c) for c in comps}
+        games.append({"id": str(event.get("id", "")), "date": (event.get("date") or "")[:10], "other_id": other,
+                      "pts_for": scores.get(team_id), "pts_against": scores.get(other)})
     return sorted(games, key=lambda g: g["date"], reverse=True)
 
 
@@ -493,13 +523,15 @@ def load_boxscore(site, event_id):
 def _clean_box(df, sport_key):
     df = df.copy()
     for col in df.columns:
-        if col in ("team_id", "pid", "Player", "pos", "C/ATT", "3PT"):
+        if col in ("team_id", "pid", "Player", "pos", "C/ATT", "3PT", "FG"):
             continue
         df[col] = pd.to_numeric(df[col], errors="coerce")
     num = lambda c: df[c].fillna(0) if c in df else 0
     if sport_key == "nba":
         if "3PT" in df:
             df["3PM"] = pd.to_numeric(df["3PT"].astype(str).str.split("-").str[0], errors="coerce")
+        if "FG" in df:
+            df["FGA"] = pd.to_numeric(df["FG"].astype(str).str.split("-").str[1], errors="coerce")
         df["PRA"] = num("PTS") + num("REB") + num("AST")
     else:
         if "C/ATT" in df:
@@ -686,10 +718,10 @@ def star_card(cfg, star, team_by_id):
     )
 
 
-def build_insights(cfg, player, opponent, items, questionable, star_html=""):
+def build_insights(cfg, player, opponent, items, questionable, star_html="", extra_html=""):
     nba = cfg["key"] == "nba"
     opp = html.escape(opponent["abbr"])
-    if not items and not star_html:
+    if not items and not star_html and not extra_html:
         return ""
 
     def who(slot):
@@ -709,6 +741,8 @@ def build_insights(cfg, player, opponent, items, questionable, star_html=""):
         )
     else:
         parts.append('<div class="insights-title">💡 Matchup insights</div>')
+    if extra_html:
+        parts.append(extra_html)  # game environment + usage trend sentences
     if star_html:
         parts.append(star_html)
     if not items:
@@ -742,6 +776,205 @@ def build_insights(cfg, player, opponent, items, questionable, star_html=""):
     parts.append(f'<div class="muted" style="margin-top:.7rem">Based on {opp}\'s last {DVP_GAMES[cfg["key"]]} games '
                  f'and each player\'s season averages. Trends, not guarantees.</div>')
     return f'<div class="insights">{"".join(parts)}</div>'
+
+
+# ---------- GAME ENVIRONMENT ----------
+# Is this going to be a shootout or a slog? Uses each team's recent scoring plus the
+# sportsbook spread and over/under that ESPN shows on its game pages (free).
+ENV_GAMES = {"nba": 10, "nfl": 8}
+ENV_EDGE = 0.04  # 4% above/below the league's average total = high/low scoring
+
+
+def team_form(cfg, team_id):
+    """Average points scored and allowed over the team's recent games."""
+    current = cfg["season_fn"]()
+    games = []
+    for season in (current, current - 1):
+        try:
+            games += [g for g in load_completed_games(cfg["site"], team_id, season)
+                      if g.get("pts_for") is not None and g.get("pts_against") is not None]
+        except Exception:
+            pass
+        if len(games) >= 3:
+            break
+    games = games[:ENV_GAMES[cfg["key"]]]
+    if len(games) < 2:
+        return None
+    return {"for": sum(g["pts_for"] for g in games) / len(games),
+            "against": sum(g["pts_against"] for g in games) / len(games), "n": len(games)}
+
+
+@st.cache_data(ttl=6 * 3600)
+def league_avg_total(sport_name):
+    cfg = SPORTS[sport_name]
+    teams = load_teams(cfg["site"])
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        forms = [f for f in pool.map(lambda t: team_form(cfg, t["id"]), teams) if f]
+    return sum(f["for"] + f["against"] for f in forms) / len(forms) if forms else None
+
+
+@st.cache_data(ttl=30 * 60)
+def load_game_odds(site, event_id):
+    """Spread and over/under from ESPN's game page (they list a sportsbook's line)."""
+    data = get_json(f"{site}/summary", params={"event": event_id})
+    for src in (data.get("pickcenter") or []) + (data.get("odds") or []):
+        if not isinstance(src, dict):
+            continue
+        total = src.get("overUnder")
+        try:
+            total = float(total) if total not in (None, "") else None
+        except (TypeError, ValueError):
+            total = None
+        details = src.get("details") or ""
+        if total or details:
+            return {"total": total, "details": details, "provider": (src.get("provider") or {}).get("name", "")}
+    return None
+
+
+def implied_totals(total, details, team_abbr, opp_abbr):
+    """Turn 'KC -3.5' and O/U 47.5 into each team's expected points (25.5 and 22)."""
+    if not total:
+        return None
+    if not details or details.upper() in ("EVEN", "PK", "PICK"):
+        return {team_abbr: total / 2, opp_abbr: total / 2}
+    parts = details.split()
+    try:
+        fav, spread = parts[0], abs(float(parts[-1]))
+    except (ValueError, IndexError):
+        return None
+    if fav not in (team_abbr, opp_abbr):
+        return None
+    dog = opp_abbr if fav == team_abbr else team_abbr
+    return {fav: (total + spread) / 2, dog: (total - spread) / 2}
+
+
+def game_environment(cfg, sport_name, team, opp, event_id=None):
+    a, b = team_form(cfg, team["id"]), team_form(cfg, opp["id"])
+    if not a or not b:
+        return None
+    env = {
+        "proj_team": (a["for"] + b["against"]) / 2,  # what team usually scores + what opp usually allows
+        "proj_opp": (b["for"] + a["against"]) / 2,
+        "league": league_avg_total(sport_name),
+        "odds": None, "implied": None,
+    }
+    env["proj_total"] = env["proj_team"] + env["proj_opp"]
+    if event_id:
+        try:
+            env["odds"] = load_game_odds(cfg["site"], event_id)
+        except Exception:
+            pass
+    total = (env["odds"] or {}).get("total") or env["proj_total"]
+    env["total_used"] = total
+    if env["odds"]:
+        env["implied"] = implied_totals(env["odds"]["total"], env["odds"]["details"], team["abbr"], opp["abbr"])
+    league = env["league"]
+    if league:
+        ratio = total / league
+        env["label"] = ("HIGH SCORING", "g-good") if ratio >= 1 + ENV_EDGE else \
+                       ("LOW SCORING", "g-bad") if ratio <= 1 - ENV_EDGE else ("AVERAGE PACE", "g-mid")
+    else:
+        env["label"] = ("", "g-mid")
+    return env
+
+
+def env_cards(env, team, opp):
+    cards = []
+    if env["odds"]:
+        o = env["odds"]
+        if o.get("details"):
+            cards.append(("Spread", html.escape(o["details"]), html.escape(o.get("provider") or "sportsbook")))
+        if o.get("total"):
+            cards.append(("Over/Under", f'{o["total"]:.1f}', "game total"))
+    if env["implied"]:
+        cards.append((f'{team["abbr"]} implied', f'{env["implied"].get(team["abbr"], 0):.1f}', "points from the line"))
+    cards.append(("Projected score", f'{env["proj_team"]:.0f}–{env["proj_opp"]:.0f}',
+                  f'{team["abbr"]}–{opp["abbr"]} from recent form'))
+    if env["league"]:
+        cards.append(("League avg total", f'{env["league"]:.1f}', "points per game"))
+    return "".join(f'<div class="card"><div class="card-label">{l}</div><div class="card-value">{v}</div>'
+                   f'<div class="muted">{n}</div></div>' for l, v, n in cards)
+
+
+# ---------- USAGE TRENDS ----------
+# Is his role growing? Volume and share of the team's opportunities, last 3 games vs season.
+USAGE_RECENT = 3
+USAGE_STATS = {
+    "nfl": {"QB": ["ATT", "CAR"], "RB": ["CAR", "RUSH SHARE", "TGT", "TGT SHARE"],
+            "WR": ["TGT", "TGT SHARE", "REC"], "TE": ["TGT", "TGT SHARE", "REC"]},
+    "nba": ["MIN", "FGA", "SHOT SHARE", "3PA"],
+}
+SHARE_OF = {"TGT SHARE": "TGT", "RUSH SHARE": "CAR", "SHOT SHARE": "FGA"}
+
+
+def usage_frame(cfg, history, player):
+    """This season's games with volume stats plus his share of the team's targets / carries / shots."""
+    if history.empty:
+        return pd.DataFrame(), []
+    wanted = USAGE_STATS["nba"] if cfg["key"] == "nba" else USAGE_STATS["nfl"].get(player["pos"], [])
+    season = history[history["Season"] == history["Season"].iloc[0]].copy()
+    if season.empty or not wanted:
+        return pd.DataFrame(), []
+    shares = [w for w in wanted if w in SHARE_OF and SHARE_OF[w] in season.columns]
+    if shares and "event_id" in season:
+        def one(eid):
+            try:
+                return eid, load_boxscore(cfg["site"], eid)
+            except Exception:
+                return eid, []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            boxes = dict(pool.map(one, season["event_id"].tolist()))
+        for share in shares:
+            base = SHARE_OF[share]
+            vals = []
+            for eid, mine in zip(season["event_id"], season[base]):
+                box = boxes.get(eid) or []
+                if not box:
+                    vals.append(None)
+                    continue
+                df = _clean_box(pd.DataFrame(box), cfg["key"])
+                me = df[df["pid"] == player["id"]]
+                if me.empty or base not in df:
+                    vals.append(None)
+                    continue
+                team_total = df[df["team_id"] == me.iloc[0]["team_id"]][base].fillna(0).sum()
+                vals.append(mine / team_total * 100 if team_total else None)
+            season[share] = vals
+    metrics = [w for w in wanted if w in season.columns and season[w].notna().any()]
+    return season.sort_values("Date"), metrics
+
+
+def usage_cards(season, metrics):
+    cards, trends = [], {}
+    recent = season.tail(USAGE_RECENT)
+    for m in metrics:
+        full, last = season[m].mean(), recent[m].mean()
+        if pd.isna(full) or pd.isna(last):
+            continue
+        change = (last - full) / full if full else 0
+        trends[m] = (last, full, change)
+        cls = "up" if change >= EDGE else "down" if change <= -EDGE else "flat"
+        arrow = "▲" if change > 0.02 else "▼" if change < -0.02 else "•"
+        fmt = (lambda v: f"{v:.0f}%") if "SHARE" in m else (lambda v: f"{v:.1f}")
+        cards.append(f'<div class="card"><div class="card-label">{html.escape(m)} · last {USAGE_RECENT}</div>'
+                     f'<div class="card-value">{fmt(last)}</div><div class="muted">season {fmt(full)}</div>'
+                     f'<span class="delta {cls}">{arrow} {change:+.0%}</span></div>')
+    return "".join(cards), trends
+
+
+def usage_line(player, trends):
+    """One sentence for the insights box when his role is clearly growing or shrinking."""
+    pick = next((m for m in ("TGT SHARE", "RUSH SHARE", "SHOT SHARE", "TGT", "CAR", "MIN") if m in trends), None)
+    if not pick:
+        return ""
+    last, full, change = trends[pick]
+    if abs(change) < EDGE:
+        return ""
+    fmt = (lambda v: f"{v:.0f}%") if "SHARE" in pick else (lambda v: f"{v:.1f}")
+    word = "rising 📈" if change > 0 else "falling 📉"
+    return (f'<div class="ins-line">Usage {word}: {html.escape(player["name"].split()[-1])}\'s '
+            f'{pick.lower()} is <b>{fmt(last)}</b> over his last {USAGE_RECENT} games vs <b>{fmt(full)}</b> '
+            f'on the season.</div>')
 
 
 # ---------- DISPLAY PIECES ----------
@@ -822,8 +1055,8 @@ def hero(player, my_team, opponent, games_vs, cfg):
     )
 
 
-# ---------- ONE SPORT'S PAGE ----------
-def render_sport(sport_name):
+# ---------- PLAYER LOOKUP PAGE ----------
+def render_player(sport_name):
     cfg = SPORTS[sport_name]
     key = cfg["key"]
 
@@ -884,12 +1117,45 @@ def render_sport(sport_name):
                     f'{html.escape(upcoming["status"])}</span>', unsafe_allow_html=True)
     insights_box = st.empty()  # filled in further down, once the defense numbers are loaded
 
+    # Game environment (shootout or slog?)
+    env_line = ""
+    try:
+        event_id = upcoming["id"] if upcoming and upcoming.get("opp_id") == opponent["id"] else None
+        env = game_environment(cfg, sport_name, my_team, opponent, event_id)
+    except Exception:
+        env = None
+    if env:
+        section("Game environment", "spread, total and projected score")
+        lbl, cls = env["label"]
+        badge = f'<div style="margin-bottom:.5rem"><span class="grade {cls}">{lbl}</span></div>' if lbl else ""
+        st.markdown(f'{badge}<div class="cards">{env_cards(env, my_team, opponent)}</div>', unsafe_allow_html=True)
+        if lbl in ("HIGH SCORING", "LOW SCORING") and env["league"]:
+            src = (f'O/U {env["odds"]["total"]:.1f}' if (env["odds"] or {}).get("total")
+                   else f'projected total {env["proj_total"]:.0f}')
+            env_line = (f'<div class="ins-line">{"🔥" if lbl == "HIGH SCORING" else "🧊"} {lbl.title()} game: '
+                        f'{src} vs league average {env["league"]:.1f}. '
+                        f'{"Good for everyone&#39;s numbers." if lbl == "HIGH SCORING" else "Expect fewer chances to go around."}</div>')
+
     # Averages vs this opponent
     section(f"Averages vs {opponent['abbr']}", f"compared to his average across all {len(history)} games")
     if vs_opp.empty:
         st.markdown('<div class="muted">No games against this team in the time window.</div>', unsafe_allow_html=True)
     else:
         stat_cards(vs_opp, history, stats)
+
+    # Usage trends (is his role growing?)
+    usage_html = ""
+    try:
+        useason, umetrics = usage_frame(cfg, history, player)
+    except Exception:
+        useason, umetrics = pd.DataFrame(), []
+    if umetrics:
+        section("Usage trends", f"last {USAGE_RECENT} games vs this season")
+        cards_html, trends = usage_cards(useason, umetrics)
+        st.markdown(f'<div class="cards">{cards_html}</div>', unsafe_allow_html=True)
+        chart_metric = next((m for m in umetrics if "SHARE" in m), umetrics[0])
+        st.line_chart(useason.set_index("Date")[[chart_metric]], height=220, color=THEMES[key]["primary"])
+        usage_html = usage_line(player, trends)
 
     # Defense vs position
     slots = list(NFL_SLOTS) if key == "nfl" else list(NBA_GROUPS)
@@ -966,7 +1232,7 @@ def render_sport(sport_name):
                          if (key == "nba" or r["slot"] in STAR_SLOTS) and r["avg"] >= STAR_MIN.get(r["stat"], 0)]
             star = max(star_pool, key=lambda r: r["edge"]) if star_pool else None
             insight_html = build_insights(cfg, player, opponent, my_items, questionable,
-                                          star_card(cfg, star, team_by_id))
+                                          star_card(cfg, star, team_by_id), env_line + usage_html)
         except Exception:
             insight_html = ""
     if insight_html:
@@ -1014,6 +1280,182 @@ def render_sport(sport_name):
                 injury_list(team, injuries.get(team["id"]) or injuries.get(team["name"]) or [])
     except Exception:
         st.warning("Injury report is unavailable right now.")
+
+
+# ---------- SLATE PAGE ----------
+ET = ZoneInfo("America/New_York")
+
+
+def _local(iso):
+    try:
+        return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(ET)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _safe_next(site, team_id):
+    try:
+        return load_next_game(site, team_id)
+    except Exception:
+        return None
+
+
+def slate_games(cfg, teams):
+    """The next slate: today's (or the next) NBA games, or this NFL week's games."""
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        nexts = list(pool.map(lambda t: _safe_next(cfg["site"], t["id"]), teams))
+    games = {g["id"]: g for g in nexts if g and g.get("id") and g.get("home") and g.get("away") and _local(g["date"])}
+    ordered = sorted(games.values(), key=lambda g: g["date"])
+    if not ordered:
+        return []
+    first = _local(ordered[0]["date"])
+    if cfg["key"] == "nba":
+        return [g for g in ordered if _local(g["date"]).date() == first.date()]
+    return [g for g in ordered if (_local(g["date"]) - first).days < 6]  # Thursday through Monday
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def slate_watchlist(sport_name, games_key):
+    """Every player on the slate with his matchup edge (cached for an hour)."""
+    cfg = SPORTS[sport_name]
+    teams = load_teams(cfg["site"])
+    players = load_players(cfg["site"], teams)
+    team_by_id = {t["id"]: t for t in teams}
+    pos_by_id = {p["id"]: p["pos"] for p in players}
+    try:
+        injuries = load_injuries(cfg["site"])
+    except Exception:
+        injuries = {}
+    out = []
+    for event_id, home, away, label in games_key:
+        for team_id, opp_id in ((home, away), (away, home)):
+            team, opp = team_by_id.get(team_id), team_by_id.get(opp_id)
+            if not team or not opp:
+                continue
+            inj = injuries.get(team_id) or injuries.get(team["name"]) or []
+            out_names = {r["player"] for r in inj if status_class(r["status"]) == "s-out"}
+            maybe = frozenset(r["player"] for r in inj if status_class(r["status"]) != "s-out")
+            memo = {}
+
+            def dvp_fn(s, opp_id=opp_id, memo=memo):
+                if s not in memo:
+                    memo[s] = defense_vs_position(cfg, opp_id, s, pos_by_id, team_by_id)
+                return memo[s]
+
+            try:
+                rows = teammate_slots(sport_name, players, team_id, out_names, maybe)
+                items = score_matchups(cfg, rows, dvp_fn)
+            except Exception:
+                continue
+            for r in items:
+                out.append({"name": r["name"], "slot": r["slot"], "stat": r["stat"], "avg": r["avg"],
+                            "allowed": r["allowed"], "edge": r["edge"], "returning": r.get("returning", False),
+                            "questionable": r["name"] in maybe, "team_abbr": team["abbr"],
+                            "defense_abbr": opp["abbr"], "game": label, "event_id": event_id})
+    return out
+
+
+def render_slate(sport_name):
+    cfg = SPORTS[sport_name]
+    key = cfg["key"]
+    nba = key == "nba"
+    try:
+        teams = load_teams(cfg["site"])
+    except Exception as e:
+        st.error(f"Couldn't reach ESPN right now. Try refreshing in a minute. ({e})")
+        return
+    team_by_id = {t["id"]: t for t in teams}
+
+    with st.spinner("Loading the schedule..."):
+        games = slate_games(cfg, teams)
+    if not games:
+        st.markdown('<div class="muted">No upcoming games found.</div>', unsafe_allow_html=True)
+        return
+    first = _local(games[0]["date"])
+    title = f'{first.strftime("%A, %b")} {first.day}' if nba else f'Week of {first.strftime("%b")} {first.day}'
+    section(f"Slate · {title}", f"{len(games)} games")
+
+    go_key = f"{key}_slate_go"
+    if not st.session_state.get(go_key):
+        if st.button("⭐ Find the best matchups on this slate", key=f"{key}_slate_btn", type="primary"):
+            st.session_state[go_key] = True
+        st.caption("The first run takes a minute or two (it reads every team's box scores). "
+                   "After that it's instant for the next hour.")
+
+    best_by_game = {}
+    if st.session_state.get(go_key):
+        games_key = tuple((g["id"], g["home"], g["away"], g["label"]) for g in games)
+        with st.spinner("Analyzing every matchup on the slate..."):
+            try:
+                items = slate_watchlist(sport_name, games_key)
+            except Exception:
+                items = []
+        pool = sorted([r for r in items if (nba or r["slot"] in STAR_SLOTS)
+                       and r["avg"] >= STAR_MIN.get(r["stat"], 0) and r["edge"] >= EDGE],
+                      key=lambda r: r["edge"], reverse=True)
+        for r in pool:
+            best_by_game.setdefault(r["event_id"], r)
+        section("Top plays on the slate", "biggest matchup edges on paper")
+        if not pool:
+            st.markdown('<div class="muted">No big edges on this slate.</div>', unsafe_allow_html=True)
+        rows = []
+        for i, r in enumerate(pool[:10], 1):
+            q = " <span class='status s-q'>Q</span>" if r["questionable"] or r["returning"] else ""
+            role = f"starting {r['slot'].lower()}" if nba else f"{r['slot']}s"
+            rows.append(
+                f'<div class="sneaky"><div><b>{i}. {html.escape(r["name"])}</b> '
+                f'<span class="muted">{html.escape(r["team_abbr"])} · {r["slot"]} · {html.escape(r["game"])}</span>{q}<br>'
+                f'<span class="muted">{html.escape(r["defense_abbr"])} allows {r["allowed"]:.1f} '
+                f'{STAT_WORDS.get(r["stat"], r["stat"])} to {role} vs his {r["avg"]:.1f} avg</span></div>'
+                f'<span class="edge">+{r["edge"]:.0%}</span></div>')
+        st.markdown("".join(rows), unsafe_allow_html=True)
+
+    section("Games", "spread, total, and scoring outlook")
+
+    def card(g):
+        home, away = team_by_id.get(g["home"]), team_by_id.get(g["away"])
+        if not home or not away:
+            return ""
+        try:
+            env = game_environment(cfg, sport_name, home, away, g["id"])
+        except Exception:
+            env = None
+        when = _local(g["date"])
+        when_txt = f'{when.strftime("%a")} {when.strftime("%I:%M %p").lstrip("0")} ET' if when else ""
+        meta = []
+        if env and env["odds"]:
+            if env["odds"].get("details"):
+                meta.append(html.escape(env["odds"]["details"]))
+            if env["odds"].get("total"):
+                meta.append(f'O/U {env["odds"]["total"]:.1f}')
+        if env:
+            meta.append(f'Proj {away["abbr"]} {env["proj_opp"]:.0f} · {home["abbr"]} {env["proj_team"]:.0f}')
+        badge = f'<span class="grade {env["label"][1]}">{env["label"][0]}</span>' if env and env["label"][0] else ""
+        star = best_by_game.get(g["id"])
+        star_html = (f'<div class="game-star">⭐ {html.escape(star["name"])} ({html.escape(star["team_abbr"])} '
+                     f'{star["slot"]}) +{star["edge"]:.0%}</div>') if star else ""
+        return (f'<div class="game-card" style="border-top:5px solid #{home["color"]}">'
+                f'<div class="game-teams">{html.escape(away["abbr"])} <span>@</span> {html.escape(home["abbr"])}</div>'
+                f'<div class="muted">{when_txt}</div>{badge}'
+                f'<div class="game-meta">{"<br>".join(meta)}</div>{star_html}</div>')
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        cards = list(pool.map(card, games))
+    st.markdown(f'<div class="game-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+    st.markdown('<div class="muted" style="margin-top:.8rem">Open <b>Player lookup</b> for the full breakdown on anyone.</div>',
+                unsafe_allow_html=True)
+
+
+# ---------- ONE SPORT ----------
+def render_sport(sport_name):
+    key = SPORTS[sport_name]["key"]
+    views = ["🔎 Player lookup", "📋 Slate"]
+    view = st.segmented_control("View", views, default=views[0], label_visibility="collapsed",
+                                key=f"{key}_view") or views[0]
+    if view == views[1]:
+        render_slate(sport_name)
+    else:
+        render_player(sport_name)
 
 
 # ---------- THE WEBSITE ----------
