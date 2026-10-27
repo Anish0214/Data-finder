@@ -96,53 +96,88 @@ META_COLS = ["Date", "Season", "Type", "Opp", "H/A", "Result"]
 
 
 # ---------- LOOK AND FEEL ----------
-def inject_css():
-    st.markdown(
-        """<style>
-@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Inter:wght@400;500;600&display=swap');
+THEMES = {
+    "nba": {
+        "primary": "#1D428A", "accent": "#C8102E", "bg": "#F4F6FA", "edition": "NBA EDITION",
+        # hardwood planks + a white court arc
+        "banner": "radial-gradient(circle at 88% 50%, transparent 70px, rgba(255,255,255,.85) 71px 74px, transparent 75px),"
+                  "linear-gradient(90deg, rgba(29,66,138,.55), rgba(29,66,138,0) 55%),"
+                  "repeating-linear-gradient(90deg, #C98D5B 0 58px, #B4773F 58px 60px, #D59D69 60px 130px, #BC7F4C 130px 132px)",
+    },
+    "nfl": {
+        "primary": "#013369", "accent": "#D50A0A", "bg": "#F2F5F3", "edition": "NFL EDITION",
+        # turf stripes + white yard lines
+        "banner": "linear-gradient(90deg, rgba(1,51,105,.6), rgba(1,51,105,0) 55%),"
+                  "repeating-linear-gradient(90deg, transparent 0 66px, rgba(255,255,255,.8) 66px 69px, transparent 69px 135px),"
+                  "repeating-linear-gradient(90deg, #2F7D34 0 67px, #286E2D 67px 135px)",
+    },
+}
+
+
+def inject_css(theme):
+    t = THEMES[theme]
+    css = """<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+:root { --primary: PRIMARY; --accent: ACCENT; }
+.stApp { background: BG; }
 html, body, [class*="css"], .stMarkdown, .stDataFrame { font-family: 'Inter', sans-serif; }
 #MainMenu, footer, header [data-testid="stToolbar"] { visibility: hidden; }
-.block-container { padding-top: 2rem; max-width: 1200px; }
-.brand { display:flex; align-items:baseline; gap:.75rem; margin-bottom:.25rem; }
-.brand-name { font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:2.6rem; letter-spacing:.02em;
-  background:linear-gradient(90deg,#F97316,#FACC15); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-.brand-tag { color:#8B95A7; font-size:.95rem; }
+.block-container { padding-top: 1.5rem; max-width: 1200px; }
+.banner { border-radius: 18px; padding: 1.6rem 1.8rem; margin-bottom: 1rem; background: BANNER;
+  border-bottom: 6px solid var(--accent); box-shadow: 0 8px 24px rgba(15,23,42,.18); }
+.brand-name { font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:3rem; line-height:1; color:#fff;
+  letter-spacing:.03em; text-shadow: 0 2px 8px rgba(0,0,0,.45); }
+.edition { display:inline-block; margin-top:.5rem; background:var(--accent); color:#fff; font-weight:700; font-size:.8rem;
+  letter-spacing:.12em; padding:.25rem .7rem; border-radius:6px; }
+.brand-tag { color:#fff; opacity:.9; font-size:.9rem; margin-left:.6rem; text-shadow:0 1px 4px rgba(0,0,0,.5); }
 .hero { border-radius:18px; padding:1.4rem 1.6rem; margin:1rem 0 .75rem; display:flex; align-items:center;
-  justify-content:space-between; color:#fff; box-shadow:0 10px 30px rgba(0,0,0,.35); }
+  justify-content:space-between; color:#fff; box-shadow:0 10px 24px rgba(15,23,42,.2); }
 .hero-side { flex:1; }
 .hero-side.right { text-align:right; }
-.hero-abbr { font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:2.8rem; line-height:1; opacity:.95; }
-.hero-name { font-weight:600; font-size:1.15rem; margin-top:.2rem; }
-.hero-sub { font-size:.85rem; opacity:.85; }
+.hero-abbr { font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:2.8rem; line-height:1; text-shadow:0 2px 6px rgba(0,0,0,.3); }
+.hero-name { font-weight:700; font-size:1.15rem; margin-top:.2rem; }
+.hero-sub { font-size:.85rem; opacity:.9; }
 .hero-vs { font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:1.6rem; padding:.4rem .9rem;
-  border-radius:999px; background:rgba(0,0,0,.35); margin:0 1rem; }
-.pill-game { display:inline-block; background:#1E293B; border:1px solid #334155; color:#E2E8F0; border-radius:999px;
-  padding:.35rem .9rem; font-size:.9rem; margin-bottom:.5rem; }
-.section { font-family:'Barlow Condensed',sans-serif; font-weight:700; font-size:1.5rem; letter-spacing:.03em;
-  margin:1.6rem 0 .6rem; color:#F1F5F9; text-transform:uppercase; }
-.section small { font-family:'Inter',sans-serif; font-size:.8rem; color:#8B95A7; text-transform:none; letter-spacing:0; margin-left:.5rem; }
+  border-radius:999px; background:rgba(255,255,255,.95); color:var(--primary); margin:0 1rem; }
+.pill-game { display:inline-block; background:#fff; border:2px solid var(--primary); color:var(--primary); border-radius:999px;
+  padding:.3rem .9rem; font-size:.9rem; font-weight:600; margin-bottom:.5rem; }
+.section { font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:1.55rem; letter-spacing:.03em;
+  margin:1.6rem 0 .6rem; color:var(--primary); text-transform:uppercase; border-left:5px solid var(--accent); padding-left:.6rem; }
+.section small { font-family:'Inter',sans-serif; font-size:.8rem; font-weight:500; color:#64748B; text-transform:none; letter-spacing:0; margin-left:.5rem; }
 .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:.7rem; }
-.card { background:#131A26; border:1px solid #1F2A3A; border-radius:14px; padding:.8rem .9rem; }
-.card-label { color:#8B95A7; font-size:.75rem; font-weight:600; letter-spacing:.05em; text-transform:uppercase; }
-.card-value { font-family:'Barlow Condensed',sans-serif; font-weight:700; font-size:2rem; color:#F8FAFC; line-height:1.1; }
-.delta { display:inline-block; font-size:.75rem; font-weight:600; border-radius:999px; padding:.1rem .5rem; margin-top:.2rem; }
-.up { background:rgba(34,197,94,.15); color:#4ADE80; }
-.down { background:rgba(239,68,68,.15); color:#F87171; }
-.flat { background:rgba(148,163,184,.15); color:#94A3B8; }
-.bar { height:6px; border-radius:999px; background:#1F2A3A; margin-top:.5rem; overflow:hidden; }
-.bar > div { height:100%; border-radius:999px; background:linear-gradient(90deg,#F97316,#FACC15); }
-.inj-team { font-weight:600; color:#F1F5F9; margin-bottom:.4rem; }
-.inj { display:flex; justify-content:space-between; gap:.6rem; align-items:center; background:#131A26;
-  border:1px solid #1F2A3A; border-radius:10px; padding:.5rem .7rem; margin-bottom:.4rem; font-size:.88rem; }
-.inj-name { color:#F1F5F9; font-weight:600; }
-.inj-note { color:#8B95A7; font-size:.78rem; }
+.card { background:#fff; border:1px solid #E2E8F0; border-top:4px solid var(--primary); border-radius:12px; padding:.8rem .9rem;
+  box-shadow:0 2px 8px rgba(15,23,42,.06); }
+.card-label { color:#64748B; font-size:.75rem; font-weight:700; letter-spacing:.05em; text-transform:uppercase; }
+.card-value { font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:2.1rem; color:#0F172A; line-height:1.1; }
+.delta { display:inline-block; font-size:.75rem; font-weight:700; border-radius:999px; padding:.1rem .5rem; margin-top:.2rem; }
+.up { background:#DCFCE7; color:#15803D; }
+.down { background:#FEE2E2; color:#B91C1C; }
+.flat { background:#F1F5F9; color:#64748B; }
+.bar { height:6px; border-radius:999px; background:#E2E8F0; margin-top:.5rem; overflow:hidden; }
+.bar > div { height:100%; border-radius:999px; background:linear-gradient(90deg,var(--primary),var(--accent)); }
+.inj-team { font-weight:700; color:var(--primary); margin-bottom:.4rem; }
+.inj { display:flex; justify-content:space-between; gap:.6rem; align-items:center; background:#fff;
+  border:1px solid #E2E8F0; border-radius:10px; padding:.5rem .7rem; margin-bottom:.4rem; font-size:.88rem; }
+.inj-name { color:#0F172A; font-weight:600; }
+.inj-note { color:#64748B; font-size:.78rem; }
 .status { font-size:.72rem; font-weight:700; border-radius:999px; padding:.15rem .55rem; white-space:nowrap; text-transform:uppercase; }
-.s-out { background:rgba(239,68,68,.18); color:#F87171; }
-.s-doubt { background:rgba(249,115,22,.18); color:#FB923C; }
-.s-q { background:rgba(234,179,8,.18); color:#FACC15; }
-.s-ok { background:rgba(34,197,94,.18); color:#4ADE80; }
-.muted { color:#8B95A7; font-size:.85rem; }
-</style>""",
+.s-out { background:#FEE2E2; color:#B91C1C; }
+.s-doubt { background:#FFEDD5; color:#C2410C; }
+.s-q { background:#FEF9C3; color:#A16207; }
+.s-ok { background:#DCFCE7; color:#15803D; }
+.muted { color:#64748B; font-size:.85rem; }
+</style>"""
+    css = (css.replace("PRIMARY", t["primary"]).replace("ACCENT", t["accent"])
+              .replace("BANNER", t["banner"]).replace("BG", t["bg"]))
+    st.markdown(css, unsafe_allow_html=True)
+
+
+def banner(theme):
+    t = THEMES[theme]
+    st.markdown(
+        f'<div class="banner"><div><span class="brand-name">DATA FINDER</span>'
+        f'<span class="brand-tag">matchups · trends · injuries</span></div>'
+        f'<span class="edition">{t["edition"]}</span></div>',
         unsafe_allow_html=True,
     )
 
@@ -535,13 +570,15 @@ def render_sport(sport_name):
 
 
 # ---------- THE WEBSITE ----------
-inject_css()
-st.markdown('<div class="brand"><span class="brand-name">DATA FINDER</span>'
-            '<span class="brand-tag">matchups · trends · injuries</span></div>', unsafe_allow_html=True)
+SPORT_NAMES = list(SPORTS.keys())
+chosen = st.session_state.get("sport") or SPORT_NAMES[0]   # which sport is picked decides the theme
+theme = SPORTS[chosen]["key"]
+inject_css(theme)
+banner(theme)
 
-sport = st.segmented_control("Sport", list(SPORTS.keys()), default=list(SPORTS.keys())[0],
+sport = st.segmented_control("Sport", SPORT_NAMES, default=SPORT_NAMES[0],
                              label_visibility="collapsed", key="sport")
-render_sport(sport or list(SPORTS.keys())[0])
+render_sport(sport or SPORT_NAMES[0])
 
 st.markdown('<div class="muted" style="margin-top:2rem">Data: ESPN public feeds. '
             'Game logs refresh every 3 hours. For fun and research only.</div>', unsafe_allow_html=True)
