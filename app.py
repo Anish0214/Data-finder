@@ -584,17 +584,19 @@ def recent_avgs(sport_name, player_id):
     """A player's per game averages this season (last season if he has barely played)."""
     cfg = SPORTS[sport_name]
     current = cfg["season_fn"]()
-    best = pd.DataFrame()
+    best, last_played = pd.DataFrame(), ""
     for s in (current, current - 1):
         df = load_gamelog(cfg["web"], player_id, s, cfg["season_label"](s), cfg["use_names"])
+        if not df.empty and not last_played:
+            last_played = df["Date"].max()  # most recent game he actually played
         if len(df) > len(best):
             best = df
         if len(best) >= 3:
             break
     if best.empty:
-        return {}, 0
+        return {}, 0, ""
     df = clean_numbers(best, cfg["key"])
-    return df.select_dtypes("number").mean().to_dict(), len(df)
+    return df.select_dtypes("number").mean().to_dict(), len(df), last_played
 
 
 def teammate_slots(sport_name, players, team_id, out_names):
@@ -606,8 +608,20 @@ def teammate_slots(sport_name, players, team_id, out_names):
         mates = [p for p in mates if p["pos"] in INSIGHT_STAT]
     with ThreadPoolExecutor(max_workers=8) as pool:
         avgs = list(pool.map(lambda p: recent_avgs(sport_name, p["id"]), mates))
+    # A player only counts if he played in his team's most recent games. This catches
+    # IR, long term injuries, suspensions and healthy scratches even if the injury feed misses them.
+    cutoff = ""
+    try:
+        team_games = load_completed_games(cfg["site"], team_id, cfg["season_fn"]())
+        look_back = ACTIVE_LOOKBACK[cfg["key"]]
+        if len(team_games) >= look_back:
+            cutoff = team_games[look_back - 1]["date"]
+    except Exception:
+        pass
     rows = []
-    for p, (a, games) in zip(mates, avgs):
+    for p, (a, games, last_played) in zip(mates, avgs):
+        if cutoff and last_played < cutoff:
+            continue  # hasn't played lately
         stat = INSIGHT_STAT.get(p["pos"]) if nfl else "PRA"
         if games < 2 or not a.get(stat):
             continue
@@ -627,6 +641,10 @@ def teammate_slots(sport_name, players, team_id, out_names):
 
 
 STAR_SLOTS = {"QB1", "RB1", "WR1", "WR2", "TE1"}  # "player to watch" must be a main piece of the offense
+# Minimum average to be "player to watch" (no +128% off a 19 yard average)
+STAR_MIN = {"PASS YDS": 180, "RUSH+REC YDS": 50, "REC YDS": 40, "PRA": 25}
+SNEAKY_MIN = {"PASS YDS": 120, "RUSH+REC YDS": 25, "REC YDS": 20, "PRA": 15}
+ACTIVE_LOOKBACK = {"nfl": 2, "nba": 3}  # must have played within his team's last N games
 
 
 def score_matchups(cfg, rows, dvp_for_slot):
@@ -696,7 +714,8 @@ def build_insights(cfg, player, opponent, items, questionable, star_html=""):
         parts.append(f'<div class="ins-line">🎯 Biggest soft spot: {opp} has been weakest against '
                      f'<b>{who(weakest["slot"])}</b> ({html.escape(weakest["name"])}\'s role here).</div>')
 
-    sneaky = sorted([r for r in items if r["id"] != player["id"] and r["edge"] >= EDGE],
+    sneaky = sorted([r for r in items if r["id"] != player["id"] and r["edge"] >= EDGE
+                     and r["avg"] >= SNEAKY_MIN.get(r["stat"], 0)],
                     key=lambda r: r["edge"], reverse=True)[:3]
     parts.append('<div class="ins-sub">👀 Sneaky looks on his team</div>')
     if not sneaky:
@@ -929,7 +948,8 @@ def render_sport(sport_name):
                                        my_def_for_slot)
             for r in opp_items:
                 r["defense_abbr"] = my_team["abbr"]
-            star_pool = [r for r in my_items + opp_items if key == "nba" or r["slot"] in STAR_SLOTS]
+            star_pool = [r for r in my_items + opp_items
+                         if (key == "nba" or r["slot"] in STAR_SLOTS) and r["avg"] >= STAR_MIN.get(r["stat"], 0)]
             star = max(star_pool, key=lambda r: r["edge"]) if star_pool else None
             insight_html = build_insights(cfg, player, opponent, my_items, questionable,
                                           star_card(cfg, star, team_by_id))
