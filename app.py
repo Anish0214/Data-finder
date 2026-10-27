@@ -178,6 +178,11 @@ html, body, [class*="css"], .stMarkdown, .stDataFrame { font-family: 'Inter', sa
   border-radius:10px; padding:.55rem .8rem; margin-top:.4rem; font-size:.9rem; }
 .sneaky b { color:#0F172A; }
 .edge { font-weight:800; color:#15803D; white-space:nowrap; }
+.star { background:linear-gradient(135deg,#FFFBEB,#FEF3C7); border:1px solid #FCD34D; border-radius:12px;
+  padding:.7rem .9rem; margin:.6rem 0 .3rem; }
+.star-label { font-size:.75rem; font-weight:800; color:#B45309; letter-spacing:.08em; text-transform:uppercase; }
+.star-name { font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:1.6rem; color:#0F172A; line-height:1.15; }
+.star-name span { font-family:'Inter',sans-serif; font-size:.8rem; font-weight:600; color:#92400E; margin-left:.4rem; }
 </style>"""
     css = (css.replace("PRIMARY", t["primary"]).replace("ACCENT", t["accent"])
               .replace("BANNER", t["banner"]).replace("BG", t["bg"]))
@@ -621,9 +626,12 @@ def teammate_slots(sport_name, players, team_id, out_names):
     return rows
 
 
-def build_insights(cfg, player, opponent, rows, dvp_for_slot, questionable):
+STAR_SLOTS = {"QB1", "RB1", "WR1", "WR2", "TE1"}  # "player to watch" must be a main piece of the offense
+
+
+def score_matchups(cfg, rows, dvp_for_slot):
+    """For each player: what the defense allows at his role vs his own average (the 'edge')."""
     nba = cfg["key"] == "nba"
-    opp = html.escape(opponent["abbr"])
     items = []
     for r in rows:
         d = dvp_for_slot(r["slot"])
@@ -635,7 +643,30 @@ def build_insights(cfg, player, opponent, rows, dvp_for_slot, questionable):
             continue
         allowed = d[r["stat"]].mean()
         items.append({**r, "allowed": allowed, "edge": (allowed - r["avg"]) / r["avg"], "n": len(d)})
-    if not items:
+    return items
+
+
+def star_card(cfg, star, team_by_id):
+    """'Player to watch' banner: best matchup on paper from EITHER team in the game."""
+    if not star or star["edge"] < EDGE:
+        return ""
+    nba = cfg["key"] == "nba"
+    team = team_by_id.get(star["team_id"], {}).get("abbr", "")
+    defense = html.escape(star["defense_abbr"])
+    role = f"starting {star['slot'].lower()}" if nba else f"{star['slot']}s"
+    return (
+        f'<div class="star"><div class="star-label">⭐ Player to watch</div>'
+        f'<div class="star-name">{html.escape(star["name"])} <span>{html.escape(team)} · {star["slot"]}</span></div>'
+        f'<div class="ins-line">Best matchup on paper in this game: {defense} allows <b>{star["allowed"]:.1f} '
+        f'{STAT_WORDS.get(star["stat"], star["stat"])}</b> to {role} vs his <b>{star["avg"]:.1f}</b> average '
+        f'<span class="edge">+{star["edge"]:.0%}</span></div></div>'
+    )
+
+
+def build_insights(cfg, player, opponent, items, questionable, star_html=""):
+    nba = cfg["key"] == "nba"
+    opp = html.escape(opponent["abbr"])
+    if not items and not star_html:
         return ""
 
     def who(slot):
@@ -655,6 +686,10 @@ def build_insights(cfg, player, opponent, rows, dvp_for_slot, questionable):
         )
     else:
         parts.append('<div class="insights-title">💡 Matchup insights</div>')
+    if star_html:
+        parts.append(star_html)
+    if not items:
+        return f'<div class="insights">{"".join(parts)}</div>'
 
     weakest = max(items, key=lambda r: r["edge"])
     if weakest["edge"] >= EDGE:
@@ -874,10 +909,30 @@ def render_sport(sport_name):
             dvp_cache[s] = defense_vs_position(cfg, opponent["id"], s, pos_by_id, team_by_id)
         return dvp_cache[s]
 
+    # The other side of the game: the opponent's players vs OUR player's team defense
+    opp_inj = injuries.get(opponent["id"]) or injuries.get(opponent["name"]) or []
+    opp_out = {r["player"] for r in opp_inj if status_class(r["status"]) == "s-out"}
+    my_def_cache = {}
+
+    def my_def_for_slot(s):
+        if s not in my_def_cache:
+            my_def_cache[s] = defense_vs_position(cfg, my_team["id"], s, pos_by_id, team_by_id)
+        return my_def_cache[s]
+
     with st.spinner("Writing matchup insights..."):
         try:
-            mates = teammate_slots(sport_name, players, player["team_id"], out_names)
-            insight_html = build_insights(cfg, player, opponent, mates, dvp_for_slot, questionable)
+            my_items = score_matchups(cfg, teammate_slots(sport_name, players, player["team_id"], out_names),
+                                      dvp_for_slot)
+            for r in my_items:
+                r["defense_abbr"] = opponent["abbr"]
+            opp_items = score_matchups(cfg, teammate_slots(sport_name, players, opponent["id"], opp_out),
+                                       my_def_for_slot)
+            for r in opp_items:
+                r["defense_abbr"] = my_team["abbr"]
+            star_pool = [r for r in my_items + opp_items if key == "nba" or r["slot"] in STAR_SLOTS]
+            star = max(star_pool, key=lambda r: r["edge"]) if star_pool else None
+            insight_html = build_insights(cfg, player, opponent, my_items, questionable,
+                                          star_card(cfg, star, team_by_id))
         except Exception:
             insight_html = ""
     if insight_html:
