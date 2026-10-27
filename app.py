@@ -387,6 +387,171 @@ def load_next_game(site, team_id):
     return upcoming[0] if upcoming else None
 
 
+# ---------- DEFENSE VS POSITION ----------
+# "What does this defense give up to WR1s / point guards?"
+# We look at the opponent's recent games, open each box score, and pull out
+# the players from the OTHER team who played the chosen position.
+
+# NFL slots: position, stat used to rank players in that game, which one (1 = best)
+NFL_SLOTS = {
+    "QB1": ("QB", "ATT", 1), "RB1": ("RB", "RUSH+REC YDS", 1), "RB2": ("RB", "RUSH+REC YDS", 2),
+    "WR1": ("WR", "REC YDS", 1), "WR2": ("WR", "REC YDS", 2), "WR3": ("WR", "REC YDS", 3),
+    "TE1": ("TE", "REC YDS", 1),
+}
+NFL_SLOT_STATS = {
+    "QB": ["CMP", "ATT", "PASS YDS", "PASS TD", "INT", "RUSH YDS"],
+    "RB": ["CAR", "RUSH YDS", "REC", "REC YDS", "RUSH+REC YDS", "TD"],
+    "WR": ["REC", "TGT", "REC YDS", "REC TD"],
+    "TE": ["REC", "TGT", "REC YDS", "REC TD"],
+}
+# NBA groups: which positions count, minimum minutes to count a player
+NBA_GROUPS = {"Guards": ("PG", "SG", "G"), "Forwards": ("SF", "PF", "F"), "Centers": ("C",)}
+NBA_GROUP_STATS = ["MIN", "PTS", "REB", "AST", "3PM", "PRA"]
+NBA_MIN_MINUTES = 15
+DVP_GAMES = {"nba": 15, "nfl": 10}   # how many of the opponent's recent games to look at
+
+# Box score column names (ESPN's long names and short labels -> our names)
+BOX_KEYS = {**NAME_MAP,
+            "completions/passingAttempts": "C/ATT",
+            "minutes": "MIN", "points": "PTS", "rebounds": "REB", "totalRebounds": "REB",
+            "assists": "AST", "steals": "STL", "blocks": "BLK", "turnovers": "TO",
+            "threePointFieldGoalsMade-threePointFieldGoalsAttempted": "3PT"}
+BOX_LABELS = {
+    "passing": {"C/ATT": "C/ATT", "YDS": "PASS YDS", "TD": "PASS TD", "INT": "INT"},
+    "rushing": {"CAR": "CAR", "YDS": "RUSH YDS", "TD": "RUSH TD"},
+    "receiving": {"REC": "REC", "YDS": "REC YDS", "TD": "REC TD", "TGTS": "TGT", "TGT": "TGT"},
+    "": {"MIN": "MIN", "PTS": "PTS", "REB": "REB", "AST": "AST", "STL": "STL", "BLK": "BLK", "TO": "TO", "3PT": "3PT"},
+}
+
+
+@st.cache_data(ttl=6 * 3600)
+def load_completed_games(site, team_id, season):
+    """A team's finished games in one season (newest first)."""
+    data = get_json(f"{site}/teams/{team_id}/schedule", params={"season": season})
+    games = []
+    for event in data.get("events", []):
+        comp = (event.get("competitions") or [{}])[0]
+        status = (comp.get("status") or event.get("status") or {}).get("type", {})
+        if not (status.get("completed") or status.get("state") == "post"):
+            continue
+        sides = [str((c.get("team") or {}).get("id", "")) for c in comp.get("competitors", [])]
+        other = next((s for s in sides if s != team_id), "")
+        games.append({"id": str(event.get("id", "")), "date": (event.get("date") or "")[:10], "other_id": other})
+    return sorted(games, key=lambda g: g["date"], reverse=True)
+
+
+@st.cache_data(ttl=24 * 3600)  # finished games never change, so keep them a full day
+def load_boxscore(site, event_id):
+    """Every player's stat line from one game."""
+    data = get_json(f"{site}/summary", params={"event": event_id})
+    out = {}
+    for team_block in (data.get("boxscore") or {}).get("players", []):
+        team_id = str((team_block.get("team") or {}).get("id", ""))
+        for group in team_block.get("statistics", []):
+            group_name = (group.get("name") or "").lower()
+            keys = group.get("keys") or []
+            labels = group.get("labels") or group.get("names") or []
+            label_map = BOX_LABELS.get(group_name, BOX_LABELS[""])
+            for a in group.get("athletes", []):
+                if a.get("didNotPlay"):
+                    continue
+                athlete = a.get("athlete") or {}
+                pid = str(athlete.get("id", ""))
+                stats = a.get("stats") or []
+                if not pid or not stats:
+                    continue
+                row = out.setdefault(pid, {
+                    "team_id": team_id, "pid": pid, "Player": athlete.get("displayName", ""),
+                    "pos": (athlete.get("position") or {}).get("abbreviation", ""),
+                })
+                for i, value in enumerate(stats):
+                    k = keys[i] if i < len(keys) else ""
+                    lbl = (labels[i] if i < len(labels) else "").upper()
+                    name = BOX_KEYS.get(k) or label_map.get(lbl)
+                    if name and name not in row:
+                        row[name] = value
+    return list(out.values())
+
+
+def _clean_box(df, sport_key):
+    df = df.copy()
+    for col in df.columns:
+        if col in ("team_id", "pid", "Player", "pos", "C/ATT", "3PT"):
+            continue
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    num = lambda c: df[c].fillna(0) if c in df else 0
+    if sport_key == "nba":
+        if "3PT" in df:
+            df["3PM"] = pd.to_numeric(df["3PT"].astype(str).str.split("-").str[0], errors="coerce")
+        df["PRA"] = num("PTS") + num("REB") + num("AST")
+    else:
+        if "C/ATT" in df:
+            parts = df["C/ATT"].astype(str).str.split("/")
+            df["CMP"] = pd.to_numeric(parts.str[0], errors="coerce")
+            df["ATT"] = pd.to_numeric(parts.str[1], errors="coerce")
+        df["RUSH+REC YDS"] = num("RUSH YDS") + num("REC YDS")
+        df["TD"] = num("RUSH TD") + num("REC TD")
+    return df
+
+
+def defense_vs_position(cfg, opponent_id, slot, pos_by_id, team_by_id):
+    """One row per (game, player) for players at `slot` who faced `opponent_id`."""
+    sport_key = cfg["key"]
+    want = DVP_GAMES[sport_key]
+    current = cfg["season_fn"]()
+    games = []
+    for season in (current, current - 1):  # early in the season, borrow last season's games
+        try:
+            games += load_completed_games(cfg["site"], opponent_id, season)
+        except Exception:
+            pass
+        if len(games) >= want:
+            break
+    games = list({g["id"]: g for g in games}.values())[:want]  # no game counted twice
+    if not games:
+        return pd.DataFrame()
+
+    def one(g):
+        try:
+            return g, load_boxscore(cfg["site"], g["id"])
+        except Exception:
+            return g, []
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(one, games))
+
+    rows = []
+    for game, box in results:
+        if not box:
+            continue
+        df = _clean_box(pd.DataFrame(box), sport_key)
+        df["pos"] = [p or pos_by_id.get(pid, "") for p, pid in zip(df["pos"], df["pid"])]
+        facing = df[df["team_id"] != opponent_id]  # the offense that played against this defense
+        if sport_key == "nfl":
+            pos, rank_stat, nth = NFL_SLOTS[slot]
+            at_pos = facing[facing["pos"] == pos]
+            if rank_stat not in at_pos or len(at_pos) < nth:
+                continue
+            picked = at_pos.sort_values(rank_stat, ascending=False).iloc[[nth - 1]]
+        else:
+            group = NBA_GROUPS[slot]
+            picked = facing[facing["pos"].isin(group)]
+            if "MIN" in picked:
+                picked = picked[picked["MIN"].fillna(0) >= NBA_MIN_MINUTES]
+        for _, r in picked.iterrows():
+            row = r.to_dict()
+            row["Date"] = game["date"]
+            row["Team"] = team_by_id.get(game["other_id"], {}).get("abbr", "")
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def default_slot(cfg, pos):
+    if cfg["key"] == "nfl":
+        return f"{pos}1" if f"{pos}1" in NFL_SLOTS else "WR1"
+    return next((g for g, members in NBA_GROUPS.items() if pos in members), "Guards")
+
+
 # ---------- DISPLAY PIECES ----------
 def pick_stats(cfg, pos, df):
     wanted = cfg["stats_by_pos"].get(pos) or cfg["default_stats"]
@@ -533,6 +698,40 @@ def render_sport(sport_name):
     else:
         stat_cards(vs_opp, history, stats)
 
+    # Defense vs position
+    slots = list(NFL_SLOTS) if key == "nfl" else list(NBA_GROUPS)
+    slot_default = default_slot(cfg, player["pos"])
+    section(f"{opponent['abbr']} defense vs position",
+            f"what {opponent['abbr']} allowed in its last {DVP_GAMES[key]} games")
+    slot = st.segmented_control("Position", slots, default=slot_default, label_visibility="collapsed",
+                                key=f"{key}_slot_{player['id']}_{opponent['id']}") or slot_default
+    pos_by_id = {p["id"]: p["pos"] for p in players}
+    with st.spinner(f"Reading {opponent['abbr']} box scores..."):
+        dvp = defense_vs_position(cfg, opponent["id"], slot, pos_by_id, team_by_id)
+    if key == "nfl":
+        dvp_stats = NFL_SLOT_STATS[NFL_SLOTS[slot][0]]
+        who = f"{slot}s"
+    else:
+        dvp_stats = NBA_GROUP_STATS
+        who = slot.lower()
+    dvp_stats = [s for s in dvp_stats if not dvp.empty and s in dvp.columns]
+    if dvp.empty or not dvp_stats:
+        st.markdown('<div class="muted">No box score data for this defense yet.</div>', unsafe_allow_html=True)
+    else:
+        cards = []
+        for s in dvp_stats:
+            mine = (f'<div class="muted">{html.escape(player["name"].split()[-1])} avg: {history[s].mean():.1f}</div>'
+                    if s in history.columns else "")
+            cards.append(f'<div class="card"><div class="card-label">{html.escape(s)} allowed</div>'
+                         f'<div class="card-value">{dvp[s].mean():.1f}</div>{mine}</div>')
+        unit = "player games" if key == "nba" else "games"
+        st.markdown(f'<div class="muted" style="margin-bottom:.5rem">Average per {who[:-1] if who.endswith("s") else who} '
+                    f'vs {opponent["abbr"]} · {len(dvp)} {unit}</div>'
+                    f'<div class="cards">{"".join(cards)}</div>', unsafe_allow_html=True)
+        with st.expander(f"Game by game: {who} vs {opponent['abbr']}"):
+            st.dataframe(dvp[["Date", "Team", "Player", "pos"] + dvp_stats].rename(columns={"pos": "Pos"}),
+                         hide_index=True, width="stretch")
+
     # Line checker
     section("Line checker", "how often he went over a number")
     c1, c2 = st.columns(2)
@@ -546,6 +745,8 @@ def render_sport(sport_name):
         + hit_card(f"Last {n}", history.head(n)[line_stat], line_value)
         + hit_card("This season", this_season[line_stat], line_value)
         + hit_card("All games", history[line_stat], line_value)
+        + (hit_card(f"{who} vs {opponent['abbr']}", dvp[line_stat], line_value)
+           if not dvp.empty and line_stat in dvp.columns else "")
         + "</div>",
         unsafe_allow_html=True,
     )
