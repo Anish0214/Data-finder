@@ -2469,26 +2469,56 @@ def soccer_players(code, teams):
     return sorted([p for r in results for p in r], key=lambda p: p["name"])
 
 
+def _soccer_event(e):
+    comp = (e.get("competitions") or [{}])[0]
+    status = (comp.get("status") or e.get("status") or {}).get("type", {})
+    sides = {c.get("homeAway"): c for c in comp.get("competitors", [])}
+    h, a = sides.get("home") or {}, sides.get("away") or {}
+    ht, at = h.get("team") or {}, a.get("team") or {}
+    done = bool(status.get("completed") or status.get("state") == "post")
+    return {
+        "id": str(e.get("id", "")), "date": e.get("date", ""),
+        "label": e.get("shortName") or f'{at.get("abbreviation", "")} @ {ht.get("abbreviation", "")}',
+        "done": done,
+        "home_id": str(ht.get("id", "")), "away_id": str(at.get("id", "")),
+        "home_name": ht.get("displayName", ""), "away_name": at.get("displayName", ""),
+        "home_abbr": ht.get("abbreviation", ""), "away_abbr": at.get("abbreviation", ""),
+        "home_score": _score(h) if done else None, "away_score": _score(a) if done else None,
+    }
+
+
+@st.cache_data(ttl=30 * 60)
+def soccer_upcoming(code):
+    """Backup: every match ESPN lists in the next 14 days for this competition."""
+    today = dt.date.today()
+    span = f'{today.strftime("%Y%m%d")}-{(today + dt.timedelta(days=14)).strftime("%Y%m%d")}'
+    data = get_json(f"{soccer_site(code)}/scoreboard", params={"dates": span, "limit": 300})
+    return [_soccer_event(e) for e in data.get("events", [])]
+
+
 @st.cache_data(ttl=30 * 60)
 def soccer_schedule(code, team_id):
-    """A club's matches in this competition (played and upcoming), oldest first."""
-    data = get_json(f"{soccer_site(code)}/teams/{team_id}/schedule")
-    out = []
-    for e in data.get("events", []):
-        comp = (e.get("competitions") or [{}])[0]
-        status = (comp.get("status") or e.get("status") or {}).get("type", {})
-        sides = {c.get("homeAway"): c for c in comp.get("competitors", [])}
-        h, a = sides.get("home") or {}, sides.get("away") or {}
-        ht, at = h.get("team") or {}, a.get("team") or {}
-        out.append({
-            "id": str(e.get("id", "")), "date": e.get("date", ""), "label": e.get("shortName", ""),
-            "done": bool(status.get("completed") or status.get("state") == "post"),
-            "home_id": str(ht.get("id", "")), "away_id": str(at.get("id", "")),
-            "home_name": ht.get("displayName", ""), "away_name": at.get("displayName", ""),
-            "home_abbr": ht.get("abbreviation", ""), "away_abbr": at.get("abbreviation", ""),
-            "home_score": _score(h), "away_score": _score(a),
-        })
-    return sorted(out, key=lambda g: g["date"])
+    """A club's matches in this competition (played and upcoming), oldest first.
+    For soccer, ESPN only lists PLAYED matches unless you also ask for fixture=true."""
+    url = f"{soccer_site(code)}/teams/{team_id}/schedule"
+    events = list(get_json(url).get("events", []))
+    try:
+        events += get_json(url, params={"fixture": "true"}).get("events", [])
+    except Exception:
+        pass
+    games = {}
+    for e in events:
+        g = _soccer_event(e)
+        if g["id"] and g["home_id"] and g["away_id"]:
+            games[g["id"]] = g
+    if not any(not g["done"] for g in games.values()):  # still no upcoming match? check the scoreboard
+        try:
+            for g in soccer_upcoming(code):
+                if team_id in (g["home_id"], g["away_id"]) and not g["done"]:
+                    games[g["id"]] = g
+        except Exception:
+            pass
+    return sorted(games.values(), key=lambda g: g["date"])
 
 
 # ---------- Understat ----------
