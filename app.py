@@ -48,7 +48,7 @@ SPORTS = {
         "seasons_back": 4,        # how many seasons of history to pull
         "recent_games": 10,       # size of the "recent form" table
         "use_names": False,       # NBA column labels are already unique
-        "today_word": "Today",
+        "today_word": "Next game",
         "default_stats": ["MIN", "PTS", "REB", "AST", "3PM", "STL", "BLK", "TO", "PRA"],
         "stats_by_pos": {},
         "default_line": 20.5,
@@ -62,7 +62,7 @@ SPORTS = {
         "seasons_back": 6,        # NFL teams meet less often, so look further back
         "recent_games": 5,
         "use_names": True,        # NFL labels repeat (YDS appears 3x), so use ESPN's long names
-        "today_word": "This week",
+        "today_word": "Next game",
         "default_stats": [],      # empty = show whatever stats the player actually has
         "stats_by_pos": {
             "QB": ["PASS YDS", "PASS TD", "INT", "CMP", "ATT", "RUSH YDS", "PASS+RUSH YDS"],
@@ -329,19 +329,27 @@ def load_injuries(site):
 
 
 @st.cache_data(ttl=10 * 60)
-def load_games(site):
-    data = get_json(f"{site}/scoreboard")
-    games = []
+def load_next_game(site, team_id):
+    """The team's next game that hasn't finished yet (reads the team's schedule,
+    so it works any day of the week and skips bye weeks)."""
+    data = get_json(f"{site}/teams/{team_id}/schedule")
+    upcoming = []
     for event in data.get("events", []):
-        comp = event["competitions"][0]
-        sides = {c["homeAway"]: str(c["team"]["id"]) for c in comp["competitors"]}
-        games.append({
-            "home": sides.get("home"),
-            "away": sides.get("away"),
+        comp = (event.get("competitions") or [{}])[0]
+        status = (comp.get("status") or event.get("status") or {}).get("type", {})
+        if status.get("completed") or status.get("state") == "post":
+            continue  # already played
+        sides = {c.get("homeAway"): str((c.get("team") or {}).get("id", "")) for c in comp.get("competitors", [])}
+        if team_id not in sides.values():
+            continue
+        upcoming.append({
+            "date": event.get("date", ""),
+            "opp_id": sides.get("away") if sides.get("home") == team_id else sides.get("home"),
             "label": event.get("shortName", ""),
-            "status": event.get("status", {}).get("type", {}).get("shortDetail", ""),
+            "status": status.get("shortDetail", ""),
         })
-    return games
+    upcoming.sort(key=lambda g: g["date"])
+    return upcoming[0] if upcoming else None
 
 
 # ---------- DISPLAY PIECES ----------
@@ -435,11 +443,6 @@ def render_sport(sport_name):
         return
     team_by_id = {t["id"]: t for t in teams}
 
-    try:
-        games = load_games(cfg["site"])
-    except Exception:
-        games = []
-
     col1, col2 = st.columns(2)
     with col1:
         player = st.selectbox(
@@ -448,12 +451,12 @@ def render_sport(sport_name):
             format_func=lambda p: f"{p['name']} ({p['team_abbr']}{', ' + p['pos'] if p['pos'] else ''})",
         )
 
-    upcoming = None  # if the player's team has a game today / this week, pre select that opponent
+    upcoming = None  # the player's next game, used to pre select the opponent
     if player:
-        for g in games:
-            if player["team_id"] in (g["home"], g["away"]):
-                upcoming = {"opp_id": g["away"] if g["home"] == player["team_id"] else g["home"], **g}
-                break
+        try:
+            upcoming = load_next_game(cfg["site"], player["team_id"])
+        except Exception:
+            upcoming = None
 
     with col2:
         default_index = None
