@@ -71,7 +71,7 @@ SPORTS = {
             "WR": ["REC", "TGT", "REC YDS", "REC TD", "LNG REC", "RUSH+REC YDS"],
             "TE": ["REC", "TGT", "REC YDS", "REC TD", "LNG REC"],
         },
-        "default_line": 35.5,
+        "default_line": 49.5,
     },
 }
 
@@ -166,6 +166,18 @@ html, body, [class*="css"], .stMarkdown, .stDataFrame { font-family: 'Inter', sa
 .s-q { background:#FEF9C3; color:#A16207; }
 .s-ok { background:#DCFCE7; color:#15803D; }
 .muted { color:#64748B; font-size:.85rem; }
+.insights { background:#fff; border:1px solid #E2E8F0; border-left:6px solid var(--accent); border-radius:14px;
+  padding:1rem 1.2rem; margin:.8rem 0 .4rem; box-shadow:0 2px 10px rgba(15,23,42,.07); }
+.insights-title { font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:1.4rem; color:var(--primary);
+  text-transform:uppercase; letter-spacing:.03em; display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
+.grade { font-family:'Inter',sans-serif; font-size:.72rem; font-weight:700; padding:.2rem .6rem; border-radius:999px; letter-spacing:.04em; }
+.g-good { background:#DCFCE7; color:#15803D; } .g-bad { background:#FEE2E2; color:#B91C1C; } .g-mid { background:#F1F5F9; color:#475569; }
+.ins-line { color:#0F172A; font-size:.95rem; margin:.45rem 0; line-height:1.45; }
+.ins-sub { font-weight:700; color:var(--primary); font-size:.8rem; text-transform:uppercase; letter-spacing:.06em; margin-top:.8rem; }
+.sneaky { display:flex; justify-content:space-between; align-items:center; gap:.8rem; background:#F8FAFC; border:1px solid #E2E8F0;
+  border-radius:10px; padding:.55rem .8rem; margin-top:.4rem; font-size:.9rem; }
+.sneaky b { color:#0F172A; }
+.edge { font-weight:800; color:#15803D; white-space:nowrap; }
 </style>"""
     css = (css.replace("PRIMARY", t["primary"]).replace("ACCENT", t["accent"])
               .replace("BANNER", t["banner"]).replace("BG", t["bg"]))
@@ -552,6 +564,120 @@ def default_slot(cfg, pos):
     return next((g for g, members in NBA_GROUPS.items() if pos in members), "Guards")
 
 
+# ---------- MATCHUP INSIGHTS ----------
+# Compares what the defense allows at each position to each player's own average,
+# then writes it up in plain English. Pure math, no AI, so it's free and instant.
+INSIGHT_STAT = {"QB": "PASS YDS", "RB": "RUSH+REC YDS", "WR": "REC YDS", "TE": "REC YDS"}
+STAT_WORDS = {"PASS YDS": "passing yards", "RUSH+REC YDS": "rush + rec yards",
+              "REC YDS": "receiving yards", "PRA": "pts + reb + ast"}
+EDGE = 0.15              # 15%+ above/below a player's average counts as a real edge
+NBA_STARTER_MINUTES = 24  # NBA comparisons use starter level minutes only
+
+
+@st.cache_data(ttl=3 * 3600)
+def recent_avgs(sport_name, player_id):
+    """A player's per game averages this season (last season if he has barely played)."""
+    cfg = SPORTS[sport_name]
+    current = cfg["season_fn"]()
+    best = pd.DataFrame()
+    for s in (current, current - 1):
+        df = load_gamelog(cfg["web"], player_id, s, cfg["season_label"](s), cfg["use_names"])
+        if len(df) > len(best):
+            best = df
+        if len(best) >= 3:
+            break
+    if best.empty:
+        return {}, 0
+    df = clean_numbers(best, cfg["key"])
+    return df.select_dtypes("number").mean().to_dict(), len(df)
+
+
+def teammate_slots(sport_name, players, team_id, out_names):
+    """Figure out each healthy teammate's role (WR1, TE1, Guards...) from this season's numbers."""
+    cfg = SPORTS[sport_name]
+    nfl = cfg["key"] == "nfl"
+    mates = [p for p in players if p["team_id"] == team_id and p["name"] not in out_names]
+    if nfl:
+        mates = [p for p in mates if p["pos"] in INSIGHT_STAT]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        avgs = list(pool.map(lambda p: recent_avgs(sport_name, p["id"]), mates))
+    rows = []
+    for p, (a, games) in zip(mates, avgs):
+        stat = INSIGHT_STAT.get(p["pos"]) if nfl else "PRA"
+        if games < 2 or not a.get(stat):
+            continue
+        if not nfl and a.get("MIN", 0) < NBA_STARTER_MINUTES:
+            continue
+        rows.append({**p, "stat": stat, "avg": a[stat], "rank_val": a.get("ATT" if p["pos"] == "QB" else stat, 0)})
+    if nfl:  # WR with most receiving yards = WR1, and so on
+        for pos in INSIGHT_STAT:
+            group = sorted([r for r in rows if r["pos"] == pos], key=lambda r: r["rank_val"], reverse=True)
+            for i, r in enumerate(group):
+                r["slot"] = f"{pos}{i + 1}"
+        rows = [r for r in rows if r.get("slot") in NFL_SLOTS]
+    else:
+        for r in rows:
+            r["slot"] = default_slot(cfg, r["pos"])
+    return rows
+
+
+def build_insights(cfg, player, opponent, rows, dvp_for_slot, questionable):
+    nba = cfg["key"] == "nba"
+    opp = html.escape(opponent["abbr"])
+    items = []
+    for r in rows:
+        d = dvp_for_slot(r["slot"])
+        if d is None or d.empty or r["stat"] not in d:
+            continue
+        if nba and "MIN" in d:
+            d = d[d["MIN"].fillna(0) >= NBA_STARTER_MINUTES]
+        if len(d) < 3:
+            continue
+        allowed = d[r["stat"]].mean()
+        items.append({**r, "allowed": allowed, "edge": (allowed - r["avg"]) / r["avg"], "n": len(d)})
+    if not items:
+        return ""
+
+    def who(slot):
+        return f"starting {slot.lower()}" if nba else f"{slot}s"
+
+    me = next((r for r in items if r["id"] == player["id"]), None)
+    parts = []
+    if me:
+        e = me["edge"]
+        grade = ("g-good", "GOOD MATCHUP") if e >= EDGE else ("g-bad", "TOUGH MATCHUP") if e <= -EDGE else ("g-mid", "NEUTRAL")
+        last = html.escape(player["name"].split()[-1])
+        word = STAT_WORDS.get(me["stat"], me["stat"])
+        parts.append(f'<div class="insights-title">💡 Matchup insights <span class="grade {grade[0]}">{grade[1]}</span></div>')
+        parts.append(
+            f'<div class="ins-line">{opp} allows <b>{me["allowed"]:.1f} {word}</b> per game to {who(me["slot"])}. '
+            f'{last} averages <b>{me["avg"]:.1f}</b>, so this spot is <b>{abs(e):.0%} {"above" if e >= 0 else "below"}</b> his norm.</div>'
+        )
+    else:
+        parts.append('<div class="insights-title">💡 Matchup insights</div>')
+
+    weakest = max(items, key=lambda r: r["edge"])
+    if weakest["edge"] >= EDGE:
+        parts.append(f'<div class="ins-line">🎯 Biggest soft spot: {opp} has been weakest against '
+                     f'<b>{who(weakest["slot"])}</b> ({html.escape(weakest["name"])}\'s role here).</div>')
+
+    sneaky = sorted([r for r in items if r["id"] != player["id"] and r["edge"] >= EDGE],
+                    key=lambda r: r["edge"], reverse=True)[:3]
+    parts.append('<div class="ins-sub">👀 Sneaky looks on his team</div>')
+    if not sneaky:
+        parts.append('<div class="ins-line muted">No teammates with a big edge in this matchup.</div>')
+    for r in sneaky:
+        q = " <span class='status s-q'>Q</span>" if r["name"] in questionable else ""
+        parts.append(
+            f'<div class="sneaky"><div><b>{html.escape(r["name"])}</b> ({r["slot"]}){q}<br>'
+            f'<span class="muted">{opp} allows {r["allowed"]:.1f} {STAT_WORDS.get(r["stat"], r["stat"])} to '
+            f'{who(r["slot"])} vs his {r["avg"]:.1f} avg</span></div><span class="edge">+{r["edge"]:.0%}</span></div>'
+        )
+    parts.append(f'<div class="muted" style="margin-top:.7rem">Based on {opp}\'s last {DVP_GAMES[cfg["key"]]} games '
+                 f'and each player\'s season averages. Trends, not guarantees.</div>')
+    return f'<div class="insights">{"".join(parts)}</div>'
+
+
 # ---------- DISPLAY PIECES ----------
 def pick_stats(cfg, pos, df):
     wanted = cfg["stats_by_pos"].get(pos) or cfg["default_stats"]
@@ -690,6 +816,7 @@ def render_sport(sport_name):
     if upcoming:
         st.markdown(f'<span class="pill-game">🗓️ {cfg["today_word"]}: <b>{html.escape(upcoming["label"])}</b> · '
                     f'{html.escape(upcoming["status"])}</span>', unsafe_allow_html=True)
+    insights_box = st.empty()  # filled in further down, once the defense numbers are loaded
 
     # Averages vs this opponent
     section(f"Averages vs {opponent['abbr']}", f"compared to his average across all {len(history)} games")
@@ -731,6 +858,30 @@ def render_sport(sport_name):
         with st.expander(f"Game by game: {who} vs {opponent['abbr']}"):
             st.dataframe(dvp[["Date", "Team", "Player", "pos"] + dvp_stats].rename(columns={"pos": "Pos"}),
                          hide_index=True, width="stretch")
+
+    # Matchup insights (shown at the top of the page)
+    try:
+        injuries = load_injuries(cfg["site"])
+    except Exception:
+        injuries = {}
+    team_inj = injuries.get(my_team["id"]) or injuries.get(my_team["name"]) or []
+    out_names = {r["player"] for r in team_inj if status_class(r["status"]) == "s-out"}
+    questionable = {r["player"] for r in team_inj if status_class(r["status"]) in ("s-q", "s-doubt")}
+    dvp_cache = {slot: dvp}
+
+    def dvp_for_slot(s):
+        if s not in dvp_cache:
+            dvp_cache[s] = defense_vs_position(cfg, opponent["id"], s, pos_by_id, team_by_id)
+        return dvp_cache[s]
+
+    with st.spinner("Writing matchup insights..."):
+        try:
+            mates = teammate_slots(sport_name, players, player["team_id"], out_names)
+            insight_html = build_insights(cfg, player, opponent, mates, dvp_for_slot, questionable)
+        except Exception:
+            insight_html = ""
+    if insight_html:
+        insights_box.markdown(insight_html, unsafe_allow_html=True)
 
     # Line checker
     section("Line checker", "how often he went over a number")
