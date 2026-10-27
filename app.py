@@ -599,7 +599,7 @@ def recent_avgs(sport_name, player_id):
     return df.select_dtypes("number").mean().to_dict(), len(df), last_played
 
 
-def teammate_slots(sport_name, players, team_id, out_names):
+def teammate_slots(sport_name, players, team_id, out_names, maybe_names=frozenset()):
     """Figure out each healthy teammate's role (WR1, TE1, Guards...) from this season's numbers."""
     cfg = SPORTS[sport_name]
     nfl = cfg["key"] == "nfl"
@@ -620,14 +620,18 @@ def teammate_slots(sport_name, players, team_id, out_names):
         pass
     rows = []
     for p, (a, games, last_played) in zip(mates, avgs):
+        returning = False
         if cutoff and last_played < cutoff:
-            continue  # hasn't played lately
+            if p["name"] not in maybe_names:
+                continue  # hasn't played lately and isn't listed as possibly returning
+            returning = True  # missed time but is Questionable/Doubtful/Probable: could be back this week
         stat = INSIGHT_STAT.get(p["pos"]) if nfl else "PRA"
         if games < 2 or not a.get(stat):
             continue
         if not nfl and a.get("MIN", 0) < NBA_STARTER_MINUTES:
             continue
-        rows.append({**p, "stat": stat, "avg": a[stat], "rank_val": a.get("ATT" if p["pos"] == "QB" else stat, 0)})
+        rows.append({**p, "stat": stat, "avg": a[stat], "returning": returning,
+                     "rank_val": a.get("ATT" if p["pos"] == "QB" else stat, 0)})
     if nfl:  # WR with most receiving yards = WR1, and so on
         for pos in INSIGHT_STAT:
             group = sorted([r for r in rows if r["pos"] == pos], key=lambda r: r["rank_val"], reverse=True)
@@ -674,7 +678,8 @@ def star_card(cfg, star, team_by_id):
     role = f"starting {star['slot'].lower()}" if nba else f"{star['slot']}s"
     return (
         f'<div class="star"><div class="star-label">⭐ Player to watch</div>'
-        f'<div class="star-name">{html.escape(star["name"])} <span>{html.escape(team)} · {star["slot"]}</span></div>'
+        f'<div class="star-name">{html.escape(star["name"])} <span>{html.escape(team)} · {star["slot"]}'
+        f'{" · Q, if he plays" if star.get("returning") else ""}</span></div>'
         f'<div class="ins-line">Best matchup on paper in this game: {defense} allows <b>{star["allowed"]:.1f} '
         f'{STAT_WORDS.get(star["stat"], star["stat"])}</b> to {role} vs his <b>{star["avg"]:.1f}</b> average '
         f'<span class="edge">+{star["edge"]:.0%}</span></div></div>'
@@ -709,6 +714,13 @@ def build_insights(cfg, player, opponent, items, questionable, star_html=""):
     if not items:
         return f'<div class="insights">{"".join(parts)}</div>'
 
+    for r in items:
+        if r.get("returning") and r["id"] != player["id"]:
+            role = r["slot"] if not nba else f"a starting {r['slot'][:-1].lower()}"
+            parts.append(f'<div class="ins-line">⚠️ <b>{html.escape(r["name"])}</b> '
+                         f'<span class="status s-q">Q</span> projects as {role} if he plays. '
+                         f'If he sits, roles move up.</div>')
+
     weakest = max(items, key=lambda r: r["edge"])
     if weakest["edge"] >= EDGE:
         parts.append(f'<div class="ins-line">🎯 Biggest soft spot: {opp} has been weakest against '
@@ -721,7 +733,7 @@ def build_insights(cfg, player, opponent, items, questionable, star_html=""):
     if not sneaky:
         parts.append('<div class="ins-line muted">No teammates with a big edge in this matchup.</div>')
     for r in sneaky:
-        q = " <span class='status s-q'>Q</span>" if r["name"] in questionable else ""
+        q = " <span class='status s-q'>Q</span>" if r["name"] in questionable or r.get("returning") else ""
         parts.append(
             f'<div class="sneaky"><div><b>{html.escape(r["name"])}</b> ({r["slot"]}){q}<br>'
             f'<span class="muted">{opp} allows {r["allowed"]:.1f} {STAT_WORDS.get(r["stat"], r["stat"])} to '
@@ -920,7 +932,7 @@ def render_sport(sport_name):
         injuries = {}
     team_inj = injuries.get(my_team["id"]) or injuries.get(my_team["name"]) or []
     out_names = {r["player"] for r in team_inj if status_class(r["status"]) == "s-out"}
-    questionable = {r["player"] for r in team_inj if status_class(r["status"]) in ("s-q", "s-doubt")}
+    questionable = {r["player"] for r in team_inj if status_class(r["status"]) != "s-out"}  # Q, Doubtful, Probable
     dvp_cache = {slot: dvp}
 
     def dvp_for_slot(s):
@@ -931,6 +943,7 @@ def render_sport(sport_name):
     # The other side of the game: the opponent's players vs OUR player's team defense
     opp_inj = injuries.get(opponent["id"]) or injuries.get(opponent["name"]) or []
     opp_out = {r["player"] for r in opp_inj if status_class(r["status"]) == "s-out"}
+    opp_maybe = frozenset(r["player"] for r in opp_inj if status_class(r["status"]) != "s-out")
     my_def_cache = {}
 
     def my_def_for_slot(s):
@@ -940,11 +953,12 @@ def render_sport(sport_name):
 
     with st.spinner("Writing matchup insights..."):
         try:
-            my_items = score_matchups(cfg, teammate_slots(sport_name, players, player["team_id"], out_names),
+            my_items = score_matchups(cfg, teammate_slots(sport_name, players, player["team_id"], out_names,
+                                                          frozenset(questionable)),
                                       dvp_for_slot)
             for r in my_items:
                 r["defense_abbr"] = opponent["abbr"]
-            opp_items = score_matchups(cfg, teammate_slots(sport_name, players, opponent["id"], opp_out),
+            opp_items = score_matchups(cfg, teammate_slots(sport_name, players, opponent["id"], opp_out, opp_maybe),
                                        my_def_for_slot)
             for r in opp_items:
                 r["defense_abbr"] = my_team["abbr"]
