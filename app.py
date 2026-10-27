@@ -383,6 +383,7 @@ def load_injuries(site):
             athlete = item.get("athlete") or {}
             rows.append({
                 "player": athlete.get("displayName", ""),
+                "id": str(athlete.get("id", "") or ""),
                 "status": item.get("status", ""),
                 "note": item.get("shortComment") or item.get("longComment") or "",
             })
@@ -611,23 +612,25 @@ EDGE = 0.15              # 15%+ above/below a player's average counts as a real 
 NBA_STARTER_MINUTES = 24  # NBA comparisons use starter level minutes only
 
 
+RECENT_FORM_GAMES = {"nfl": 10, "nba": 15}  # baseline = his last N games played, across seasons
+
+
 @st.cache_data(ttl=3 * 3600)
 def recent_avgs(sport_name, player_id):
-    """A player's per game averages this season (last season if he has barely played)."""
+    """A player's per game averages over his last N games PLAYED (this season plus last season),
+    so a star returning from injury still looks like a star (e.g. a WR1 who missed 5 weeks)."""
     cfg = SPORTS[sport_name]
     current = cfg["season_fn"]()
-    best, last_played = pd.DataFrame(), ""
+    frames = []
     for s in (current, current - 1):
         df = load_gamelog(cfg["web"], player_id, s, cfg["season_label"](s), cfg["use_names"])
-        if not df.empty and not last_played:
-            last_played = df["Date"].max()  # most recent game he actually played
-        if len(df) > len(best):
-            best = df
-        if len(best) >= 3:
-            break
-    if best.empty:
+        if not df.empty:
+            frames.append(df)
+    if not frames:
         return {}, 0, ""
-    df = clean_numbers(best, cfg["key"])
+    df = pd.concat(frames, ignore_index=True).sort_values("Date", ascending=False)
+    last_played = df["Date"].max()  # most recent game he actually played
+    df = clean_numbers(df.head(RECENT_FORM_GAMES[cfg["key"]]), cfg["key"])
     return df.select_dtypes("number").mean().to_dict(), len(df), last_played
 
 
@@ -635,7 +638,7 @@ def teammate_slots(sport_name, players, team_id, out_names, maybe_names=frozense
     """Figure out each healthy teammate's role (WR1, TE1, Guards...) from this season's numbers."""
     cfg = SPORTS[sport_name]
     nfl = cfg["key"] == "nfl"
-    mates = [p for p in players if p["team_id"] == team_id and p["name"] not in out_names]
+    mates = [p for p in players if p["team_id"] == team_id and not is_listed(p, out_names)]
     if nfl:
         mates = [p for p in mates if p["pos"] in INSIGHT_STAT]
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -654,7 +657,7 @@ def teammate_slots(sport_name, players, team_id, out_names, maybe_names=frozense
     for p, (a, games, last_played) in zip(mates, avgs):
         returning = False
         if cutoff and last_played < cutoff:
-            if p["name"] not in maybe_names:
+            if not is_listed(p, maybe_names):
                 continue  # hasn't played lately and isn't listed as possibly returning
             returning = True  # missed time but is Questionable/Doubtful/Probable: could be back this week
         stat = INSIGHT_STAT.get(p["pos"]) if nfl else "PRA"
@@ -767,14 +770,14 @@ def build_insights(cfg, player, opponent, items, questionable, star_html="", ext
     if not sneaky:
         parts.append('<div class="ins-line muted">No teammates with a big edge in this matchup.</div>')
     for r in sneaky:
-        q = " <span class='status s-q'>Q</span>" if r["name"] in questionable or r.get("returning") else ""
+        q = " <span class='status s-q'>Q</span>" if is_listed(r, questionable) or r.get("returning") else ""
         parts.append(
             f'<div class="sneaky"><div><b>{html.escape(r["name"])}</b> ({r["slot"]}){q}<br>'
             f'<span class="muted">{opp} allows {r["allowed"]:.1f} {STAT_WORDS.get(r["stat"], r["stat"])} to '
             f'{who(r["slot"])} vs his {r["avg"]:.1f} avg</span></div><span class="edge">+{r["edge"]:.0%}</span></div>'
         )
     parts.append(f'<div class="muted" style="margin-top:.7rem">Based on {opp}\'s last {DVP_GAMES[cfg["key"]]} games '
-                 f'and each player\'s season averages. Trends, not guarantees.</div>')
+                 f'and each player\'s last {RECENT_FORM_GAMES[cfg["key"]]} games played. Trends, not guarantees.</div>')
     return f'<div class="insights">{"".join(parts)}</div>'
 
 
@@ -1016,14 +1019,33 @@ def hit_card(title, series, line):
 
 
 def status_class(status):
-    s = status.lower()
-    if "out" in s or "injured reserve" in s or s == "ir":
+    s = status.lower().strip()
+    out_words = ("out", "reserve", "pup", "physically unable", "suspen", "non-football", "nfi", "inactive")
+    if any(w in s for w in out_words) or s in ("ir", "ir-r", "o"):
         return "s-out"
     if "doubt" in s:
         return "s-doubt"
     if "question" in s or "day" in s:
         return "s-q"
     return "s-ok"
+
+
+def _norm(name):
+    """'Jacory Croskey-Merritt' and 'jacory croskey merritt' should match."""
+    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+
+
+def injured_keys(rows, out):
+    """IDs and normalized names of players who are Out (out=True) or Q/Doubtful/Probable (out=False)."""
+    keys = set()
+    for r in rows:
+        if (status_class(r["status"]) == "s-out") == out:
+            keys.update(k for k in (r.get("id"), "n:" + _norm(r["player"])) if k and k != "n:")
+    return keys
+
+
+def is_listed(p, keys):
+    return p.get("id") in keys or ("n:" + _norm(p.get("name", ""))) in keys
 
 
 def injury_list(team, rows):
@@ -1197,8 +1219,8 @@ def render_player(sport_name):
     except Exception:
         injuries = {}
     team_inj = injuries.get(my_team["id"]) or injuries.get(my_team["name"]) or []
-    out_names = {r["player"] for r in team_inj if status_class(r["status"]) == "s-out"}
-    questionable = {r["player"] for r in team_inj if status_class(r["status"]) != "s-out"}  # Q, Doubtful, Probable
+    out_names = injured_keys(team_inj, out=True)
+    questionable = injured_keys(team_inj, out=False)  # Q, Doubtful, Probable
     dvp_cache = {slot: dvp}
 
     def dvp_for_slot(s):
@@ -1208,8 +1230,8 @@ def render_player(sport_name):
 
     # The other side of the game: the opponent's players vs OUR player's team defense
     opp_inj = injuries.get(opponent["id"]) or injuries.get(opponent["name"]) or []
-    opp_out = {r["player"] for r in opp_inj if status_class(r["status"]) == "s-out"}
-    opp_maybe = frozenset(r["player"] for r in opp_inj if status_class(r["status"]) != "s-out")
+    opp_out = injured_keys(opp_inj, out=True)
+    opp_maybe = frozenset(injured_keys(opp_inj, out=False))
     my_def_cache = {}
 
     def my_def_for_slot(s):
@@ -1333,8 +1355,8 @@ def slate_watchlist(sport_name, games_key):
             if not team or not opp:
                 continue
             inj = injuries.get(team_id) or injuries.get(team["name"]) or []
-            out_names = {r["player"] for r in inj if status_class(r["status"]) == "s-out"}
-            maybe = frozenset(r["player"] for r in inj if status_class(r["status"]) != "s-out")
+            out_names = injured_keys(inj, out=True)
+            maybe = frozenset(injured_keys(inj, out=False))
             memo = {}
 
             def dvp_fn(s, opp_id=opp_id, memo=memo):
@@ -1350,7 +1372,7 @@ def slate_watchlist(sport_name, games_key):
             for r in items:
                 out.append({"name": r["name"], "slot": r["slot"], "stat": r["stat"], "avg": r["avg"],
                             "allowed": r["allowed"], "edge": r["edge"], "returning": r.get("returning", False),
-                            "questionable": r["name"] in maybe, "team_abbr": team["abbr"],
+                            "questionable": is_listed(r, maybe), "team_abbr": team["abbr"],
                             "defense_abbr": opp["abbr"], "game": label, "event_id": event_id})
     return out
 
