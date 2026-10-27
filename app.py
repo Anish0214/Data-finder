@@ -887,7 +887,13 @@ def render_sport(sport_name):
     section("Line checker", "how often he went over a number")
     c1, c2 = st.columns(2)
     line_stat = c1.selectbox("Stat", stats, key=f"{key}_line_stat")
-    line_value = c2.number_input("Line", min_value=0.0, value=cfg["default_line"], step=0.5, key=f"{key}_line")
+    # Default line = his average rounded to the nearest .5 (like a sportsbook), e.g. 5.3 rec -> 5.5, TDs -> 0.5
+    avg_recent = history.head(cfg["recent_games"] * 2)[line_stat].mean()
+    suggested = float(int(avg_recent)) + 0.5 if pd.notna(avg_recent) and avg_recent >= 1 else 0.5
+    if "TD" in line_stat or line_stat == "INT":  # touchdown and interception props are almost always 0.5
+        suggested = 0.5
+    line_value = c2.number_input("Line", min_value=0.0, value=suggested, step=0.5,
+                                 key=f"{key}_line_{player['id']}_{line_stat}")
     this_season = history[history["Season"] == history["Season"].iloc[0]]
     n = cfg["recent_games"]
     st.markdown(
