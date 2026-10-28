@@ -19,7 +19,9 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import requests
 import streamlit as st
 
@@ -207,7 +209,11 @@ html, body, [class*="css"], .stMarkdown, .stDataFrame { font-family: 'Inter', sa
 .sneaky b { color:#0F172A; }
 .edge { font-weight:800; color:#15803D; white-space:nowrap; }
 .game-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:.8rem; }
-.game-card { background:#fff; border:1px solid #E2E8F0; border-radius:12px; padding:.8rem 1rem; box-shadow:0 2px 8px rgba(15,23,42,.06); }
+.dmx { width:100%; border-collapse:collapse; background:#fff; border:1px solid #E2E8F0; border-radius:10px; overflow:hidden; font-size:.85rem; }
+.dmx th { text-align:left; color:#64748B; font-size:.72rem; text-transform:uppercase; letter-spacing:.05em; padding:.45rem .6rem; border-bottom:1px solid #E2E8F0; }
+.dmx td { padding:.45rem .6rem; border-bottom:1px solid #F1F5F9; color:#0F172A; font-weight:600; }
+.dmx td.up { color:#15803D; } .dmx td.down { color:#B91C1C; } .dmx td.flat { color:#64748B; }
+.game-card { margin-bottom:.4rem; background:#fff; border:1px solid #E2E8F0; border-radius:12px; padding:.8rem 1rem; box-shadow:0 2px 8px rgba(15,23,42,.06); }
 .game-teams { font-family:'Barlow Condensed',sans-serif; font-weight:800; font-size:1.7rem; color:#0F172A; }
 .game-teams span { color:#94A3B8; font-size:1.1rem; }
 .game-meta { color:#334155; font-size:.85rem; margin-top:.4rem; line-height:1.5; }
@@ -347,6 +353,8 @@ def load_gamelog(web, player_id, season, season_text, use_names):
                     "Season": season_text,
                     "Type": "Playoffs" if "post" in type_name else "Regular",
                     "opp_id": str(opp.get("id", "")),
+                    # which team he played FOR (when ESPN includes it), so trades don't mix teams
+                    "team_id": str((info.get("team") or {}).get("id", "") or ""),
                     "Opp": opp.get("abbreviation") or opp.get("displayName", ""),
                     "H/A": "Home" if info.get("atVs") == "vs" else "Away",
                     "Result": f"{info.get('gameResult', '')} {info.get('score', '')}".strip(),
@@ -360,7 +368,7 @@ def clean_numbers(df, sport_key):
     """ESPN sends stats as text. Turn them into numbers and add combo stats."""
     df = df.copy()
     for col in df.columns:
-        if col in META_COLS or col in ("opp_id", "event_id"):
+        if col in META_COLS or col in ("opp_id", "event_id", "team_id"):
             continue
         converted = pd.to_numeric(df[col], errors="coerce")
         if converted.notna().sum() >= 0.5 * df[col].notna().sum():  # mostly numbers? keep as numbers
@@ -1428,9 +1436,18 @@ def render_slate(sport_name):
     if not games:
         st.markdown('<div class="muted">No upcoming games found.</div>', unsafe_allow_html=True)
         return
+    open_id = st.session_state.get(f"{key}_game")
+    if open_id:
+        chosen = next((x for x in games if x["id"] == open_id), None)
+        if chosen:
+            render_game(sport_name, chosen)
+            return
+        st.session_state.pop(f"{key}_game", None)
+
     first = _local(games[0]["date"])
     title = f'{first.strftime("%A, %b")} {first.day}' if nba else f'Week of {first.strftime("%b")} {first.day}'
     section(f"Slate · {title}", f"{len(games)} games")
+    st.caption("Tap 📊 Game insights on any game to simulate it 10,000 times.")
 
     go_key = f"{key}_slate_go"
     if not st.session_state.get(go_key):
@@ -1498,9 +1515,809 @@ def render_slate(sport_name):
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         cards = list(pool.map(card, games))
-    st.markdown(f'<div class="game-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="muted" style="margin-top:.8rem">Open <b>Player lookup</b> for the full breakdown on anyone.</div>',
+    per_row = 3
+    for i in range(0, len(games), per_row):
+        cols = st.columns(per_row)
+        for col, g, c in zip(cols, games[i:i + per_row], cards[i:i + per_row]):
+            with col:
+                st.markdown(c, unsafe_allow_html=True)
+                if st.button("📊 Game insights", key=f'{key}_open_{g["id"]}', width="stretch"):
+                    st.session_state[f"{key}_game"] = g["id"]
+                    st.rerun()
+
+
+# ==========================================================
+# GAME INSIGHTS: tap a game on the slate and the app plays it out 10,000 times
+#
+# For every player: his recent minutes / volume and production rates (this season),
+#   x what tonight's defense allows to his position (pulled toward average when the sample is small)
+#   x the game's pace (from the Vegas total).
+# Each simulation draws a random but realistic stat line; 10,000 of them give a full range of outcomes.
+# We compare against a "normal night" (same player, average opponent, his usual minutes),
+# so a prop only shows up when tonight's numbers actually move it.
+# ==========================================================
+SIMS = 10_000
+SHRINK_GAMES = {"nba": 8, "nfl": 5}          # a defense needs this many games before we fully trust it
+FACTOR_CAP = {"nba": (0.85, 1.18), "nfl": (0.80, 1.25)}
+TEAM_SD = {"nba": 12.0, "nfl": 10.0}         # how much a team's score swings game to game
+TEAM_CORR = {"nba": 0.30, "nfl": 0.15}       # fast games lift both teams
+PROP_MIN_MOVE = 0.04                         # a prop needs to move 4+ points of probability to be listed
+
+NBA_SIM_STATS = ["PTS", "REB", "AST", "3PM"]
+NBA_DISPERSION = {"PTS": 2.2, "REB": 1.3, "AST": 1.4, "3PM": 1.25}   # how streaky each stat is
+NBA_PACE_WEIGHT = {"PTS": 1.0, "3PM": 1.0, "AST": 0.7, "REB": 0.4}
+NBA_PROP_MIN = {"PTS": 8, "REB": 3, "AST": 2, "3PM": 0.8, "PRA": 15}
+NBA_SIM_MIN_MINUTES = 14
+NBA_GROUP_OF = {p: g for g, members in NBA_GROUPS.items() for p in members}
+
+NFL_SIM_STATS = {
+    "QB": ["PASS YDS", "PASS TD", "INT", "RUSH YDS"],
+    "RB": ["RUSH YDS", "REC", "REC YDS", "RUSH+REC YDS"],
+    "WR": ["REC", "REC YDS"],
+    "TE": ["REC", "REC YDS"],
+}
+NFL_MAIN = {"QB": "PASS YDS", "RB": "RUSH+REC YDS", "WR": "REC YDS", "TE": "REC YDS"}
+NFL_COUNT_STATS = {"REC", "CAR", "PASS TD", "INT"}
+NFL_TD_PRIOR = {"QB1": 0.15, "RB1": 0.55, "RB2": 0.25, "WR1": 0.45, "WR2": 0.30, "WR3": 0.18, "TE1": 0.30}
+NFL_PROP_MIN = {"PASS YDS": 150, "RUSH YDS": 20, "REC": 2, "REC YDS": 20, "RUSH+REC YDS": 30, "PASS TD": 0.5, "INT": 0.3}
+
+
+def _seed(text):
+    return sum((i + 1) * ord(c) for i, c in enumerate(str(text))) % (2 ** 32)
+
+
+def _shrink(raw, n, sport_key):
+    """Pull a matchup number toward 1.0 (average) when it's built on few games, then cap it."""
+    if raw is None or not np.isfinite(raw) or raw <= 0:
+        return 1.0
+    k = SHRINK_GAMES[sport_key]
+    lo, hi = FACTOR_CAP[sport_key]
+    return float(min(hi, max(lo, 1 + (raw - 1) * n / (n + k))))
+
+
+def _nb(rng, lam, disp):
+    """Counts with realistic streakiness (a negative binomial)."""
+    lam = np.maximum(np.asarray(lam, dtype=float), 1e-9)
+    if disp <= 1.01:
+        return rng.poisson(lam)
+    return rng.poisson(rng.gamma(lam / (disp - 1), disp - 1))
+
+
+def _gamma(rng, mean, cv, size):
+    """Yardage: always positive, with the occasional big game."""
+    mean = np.maximum(np.asarray(mean, dtype=float), 1e-6)
+    shape = 1 / cv ** 2
+    return rng.gamma(shape, mean / shape, size)
+
+
+def book_line(avg, stat=""):
+    """Where a sportsbook would likely hang the line: his average, at the nearest .5."""
+    if stat in ("PASS TD",):
+        return 1.5 if avg >= 1.3 else 0.5
+    if stat == "INT" or avg < 1:
+        return 0.5
+    return float(int(avg)) + 0.5
+
+
+def ordinal(n):
+    n = int(n)
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+# ---------- box scores for both teams (defense vs position + league baseline) ----------
+def team_box_rows(cfg, team_id, n_games, pos_by_id):
+    """Every player line from a team's last n games (both sides). This season counts full, last season half."""
+    current = cfg["season_fn"]()
+    games = []
+    for season in (current, current - 1):
+        try:
+            got = load_completed_games(cfg["site"], team_id, season)
+        except Exception:
+            got = []
+        games += [{**g, "weight": 1.0 if season == current else 0.5} for g in got]
+        if len(games) >= n_games:
+            break
+    games = list({g["id"]: g for g in games}.values())[:n_games]
+
+    def one(g):
+        try:
+            return g, load_boxscore(cfg["site"], g["id"])
+        except Exception:
+            return g, []
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(one, games))
+    frames = []
+    for g, box in results:
+        if not box:
+            continue
+        df = _clean_box(pd.DataFrame(box), cfg["key"])
+        df["pos"] = [p or pos_by_id.get(pid, "") for p, pid in zip(df["pos"], df["pid"])]
+        df["game_id"], df["weight"] = g["id"], g["weight"]
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _games_seen(rows):
+    return float(rows.drop_duplicates("game_id")["weight"].sum()) if not rows.empty else 0.0
+
+
+def nba_defense_table(pool, def_rows, def_id):
+    """{group: {stat: factor}}: what this defense allows per minute to guards / forwards / centers vs average."""
+    def rates(df):
+        d = df[(df.get("MIN", pd.Series(dtype=float)).fillna(0) >= NBA_MIN_MINUTES)].copy()
+        d["group"] = d["pos"].map(NBA_GROUP_OF)
+        out = {}
+        for grp, gdf in d.dropna(subset=["group"]).groupby("group"):
+            mins = gdf["MIN"].sum()
+            out[grp] = {s: gdf[s].fillna(0).sum() / mins for s in NBA_SIM_STATS if s in gdf and mins}
+        return out
+    if pool.empty or def_rows.empty:
+        return {}, 0
+    base = rates(pool)
+    facing = def_rows[def_rows["team_id"] != def_id]
+    n = _games_seen(facing)
+    allowed = rates(facing)
+    table = {}
+    for grp in NBA_GROUPS:
+        table[grp] = {s: _shrink(allowed.get(grp, {}).get(s, 0) / base[grp][s], n, "nba")
+                      if base.get(grp, {}).get(s) else 1.0 for s in NBA_SIM_STATS}
+    return table, n
+
+
+def nfl_slot_lines(df):
+    """Who was each team's QB1, RB1, WR1... in each game, and what they did."""
+    out = []
+    if df.empty:
+        return pd.DataFrame()
+    for (gid, tid), gdf in df.groupby(["game_id", "team_id"]):
+        for slot, (pos, rank_stat, nth) in NFL_SLOTS.items():
+            at = gdf[gdf["pos"] == pos]
+            if rank_stat not in at or len(at) < nth:
+                continue
+            r = at.sort_values(rank_stat, ascending=False).iloc[nth - 1]
+            out.append({"game_id": gid, "team_id": tid, "slot": slot, "weight": r["weight"],
+                        "main": r.get(NFL_MAIN[pos], np.nan)})
+    return pd.DataFrame(out)
+
+
+def nfl_defense_table(pool, def_rows, def_id):
+    """{slot: (factor, allowed per game, league per game)} for QB1, RB1, WR1 ... vs this defense."""
+    base = nfl_slot_lines(pool)
+    facing = nfl_slot_lines(def_rows)
+    if base.empty or facing.empty:
+        return {}, 0
+    facing = facing[facing["team_id"] != def_id]
+    n = float(facing.drop_duplicates("game_id")["weight"].sum())
+    table = {}
+    for slot in NFL_SLOTS:
+        b = base[base["slot"] == slot]["main"].mean()
+        a = facing[facing["slot"] == slot]["main"].mean()
+        table[slot] = (_shrink(a / b if b else None, n, "nfl"), a, b)
+    return table, n
+
+
+# ---------- players ----------
+def _player_sample(cfg, p, team_id, n):
+    """His last n games THIS season with his current team, plus last season as a light prior."""
+    current = cfg["season_fn"]()
+    cur = load_gamelog(cfg["web"], p["id"], current, cfg["season_label"](current), cfg["use_names"])
+    prev = load_gamelog(cfg["web"], p["id"], current - 1, cfg["season_label"](current - 1), cfg["use_names"])
+    cur = clean_numbers(cur, cfg["key"]) if not cur.empty else cur
+    prev = clean_numbers(prev, cfg["key"]) if not prev.empty else prev
+    if not cur.empty and "team_id" in cur and cur["team_id"].astype(bool).any():
+        cur = cur[cur["team_id"] == team_id]  # traded? only count games for this team
+    if not cur.empty:
+        cur = cur.sort_values("Date", ascending=False).head(n)
+    if not prev.empty:
+        prev = prev.sort_values("Date", ascending=False)
+    return cur, prev
+
+
+def _blend_rate(cur_sum, cur_den, prev_sum, prev_den, prior_weight):
+    """This season's rate, steadied by last season's (worth `prior_weight` games) when we have it."""
+    if prev_den and prev_den > 0 and prior_weight:
+        return (cur_sum + prev_sum / prev_den * prior_weight) / (cur_den + prior_weight)
+    return cur_sum / cur_den if cur_den else 0.0
+
+
+def _confidence(n_player, n_def, sport_key):
+    hi, mid = ((8, 10), (4, 5)) if sport_key == "nba" else ((6, 6), (3, 4))
+    if n_player >= hi[0] and n_def >= hi[1]:
+        return "High"
+    if n_player >= mid[0] and n_def >= mid[1]:
+        return "Medium"
+    return "Low"
+
+
+def nba_players(cfg, team, players, injuries, rng, defense, n_def, pace):
+    inj = injuries.get(team["id"]) or injuries.get(team["name"]) or []
+    out_keys, maybe_keys = injured_keys(inj, out=True), injured_keys(inj, out=False)
+    roster = [p for p in players if p["team_id"] == team["id"] and not is_listed(p, out_keys)
+              and status_class(p.get("inj", "")) != "s-out"]
+    try:  # must have played in one of the team's last 3 games (catches injuries the feed missed)
+        recent_team = load_completed_games(cfg["site"], team["id"], cfg["season_fn"]())
+        cutoff = recent_team[min(2, len(recent_team) - 1)]["date"] if recent_team else ""
+    except Exception:
+        cutoff = ""
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        samples = list(pool.map(lambda p: (p, *_player_sample(cfg, p, team["id"], 10)), roster))
+    results = []
+    for p, cur, prev in samples:
+        if cur.empty or "MIN" not in cur:
+            continue
+        cur = cur[cur["MIN"].fillna(0) > 0]
+        if cur.empty:
+            continue
+        questionable = is_listed(p, maybe_keys)
+        if cutoff and cur["Date"].max() < cutoff and not questionable:
+            continue
+        mins_recent, mins_normal = cur.head(5)["MIN"].mean(), cur["MIN"].mean()
+        if mins_recent < NBA_SIM_MIN_MINUTES:
+            continue
+        mins_sd = max(3.5, float(cur["MIN"].std(ddof=0) or 0))
+        prev_ok = not prev.empty and "MIN" in prev and (prev["MIN"].fillna(0) > 0).sum() >= 10
+        group = NBA_GROUP_OF.get(p["pos"], "Forwards")
+        mins = np.clip(rng.normal(mins_recent, mins_sd, SIMS), 0, 46)
+        mins_n = np.clip(rng.normal(mins_normal, mins_sd, SIMS), 0, 46)
+        sim, norm, rates = {}, {}, {}
+        for s in NBA_SIM_STATS:
+            if s not in cur:
+                continue
+            rate = _blend_rate(cur[s].fillna(0).sum(), cur["MIN"].sum(),
+                               prev[s].fillna(0).sum() if prev_ok and s in prev else 0,
+                               prev["MIN"].fillna(0).sum() if prev_ok else 0, 5 * mins_normal if prev_ok else 0)
+            rates[s] = rate
+            f_def = defense.get(group, {}).get(s, 1.0)
+            f_pace = 1 + NBA_PACE_WEIGHT[s] * (pace - 1)
+            sim[s] = _nb(rng, rate * mins * f_def * f_pace, NBA_DISPERSION[s])
+            norm[s] = _nb(rng, rate * mins_n, NBA_DISPERSION[s])
+        if not {"PTS", "REB", "AST"} <= set(sim):
+            continue
+        sim["PRA"] = sim["PTS"] + sim["REB"] + sim["AST"]
+        norm["PRA"] = norm["PTS"] + norm["REB"] + norm["AST"]
+        avgs = {s: float(cur[s].mean()) for s in NBA_SIM_STATS if s in cur}
+        avgs["PRA"] = float((cur["PTS"] + cur["REB"] + cur["AST"]).mean())
+        props = []
+        for s in NBA_SIM_STATS + ["PRA"]:
+            if s in sim and avgs.get(s, 0) >= NBA_PROP_MIN[s]:
+                line = book_line(avgs[s], s)
+                props.append({"stat": s, "line": line, "p": float((sim[s] > line).mean()),
+                              "p_norm": float((norm[s] > line).mean()), "avg": avgs[s]})
+        results.append({
+            "name": p["name"], "team": team["abbr"], "role": f'{p["pos"]} · {group[:-1]}' if p["pos"] else group[:-1],
+            "group": group,
+            "questionable": questionable, "games": len(cur), "conf": _confidence(len(cur), n_def, "nba"),
+            "mins_recent": mins_recent, "mins_normal": mins_normal,
+            "proj": {s: float(np.median(v)) if s != "PRA" else float(v.mean()) for s, v in sim.items()},
+            "mean": {s: float(v.mean()) for s, v in sim.items()}, "normal": {s: float(v.mean()) for s, v in norm.items()},
+            "f_def": defense.get(group, {}), "pace": pace, "props": props, "main": "PRA",
+        })
+    return results
+
+
+def nfl_players(cfg, sport_name, team, players, injuries, rng, defense, n_def, env_factor):
+    inj = injuries.get(team["id"]) or injuries.get(team["name"]) or []
+    out_keys, maybe_keys = injured_keys(inj, out=True), injured_keys(inj, out=False)
+    try:
+        roles = teammate_slots(sport_name, players, team["id"], out_keys, frozenset(maybe_keys))
+    except Exception:
+        roles = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        samples = list(pool.map(lambda r: (r, *_player_sample(cfg, r, team["id"], 8)), roles))
+    results = []
+    for r, cur, prev in samples:
+        pos, slot = r["pos"], r["slot"]
+        sample = cur if len(cur) >= 2 else prev.head(8) if not prev.empty else cur
+        if sample.empty:
+            continue
+        n = len(cur)
+        f_slot = defense.get(slot, (1.0, None, None))[0]
+        stats = [s for s in NFL_SIM_STATS.get(pos, []) if s in sample and sample[s].notna().any()]
+        sim, norm, props, avgs = {}, {}, [], {}
+        for s in stats:
+            vals = sample[s].fillna(0)
+            avg = float(vals.mean())
+            avgs[s] = avg
+            if s in NFL_COUNT_STATS:
+                w_def = 1.0 if s in ("PASS TD",) else 0.6
+                lam = avg * (1 + w_def * (f_slot - 1)) * (1 + (1.0 if s == "PASS TD" else 0.3) * (env_factor - 1))
+                if s == "INT":
+                    lam = avg * (2 - f_slot) ** 0.5  # stingier pass defense = more picks
+                sim[s] = _nb(rng, np.full(SIMS, lam), 1.3)
+                norm[s] = _nb(rng, np.full(SIMS, avg), 1.3)
+            else:
+                cv = float(min(0.9, max(0.35, (vals.std(ddof=0) / avg) if avg else 0.6)))
+                mean = avg * f_slot * (1 + 0.5 * (env_factor - 1))
+                sim[s] = _gamma(rng, mean, cv, SIMS)
+                norm[s] = _gamma(rng, avg, cv, SIMS)
+            if avg >= NFL_PROP_MIN.get(s, 0):
+                line = book_line(avg, s)
+                props.append({"stat": s, "line": line, "p": float((sim[s] > line).mean()),
+                              "p_norm": float((norm[s] > line).mean()), "avg": avg})
+        # anytime touchdown (rushing or receiving)
+        td_cols = [c for c in ("RUSH TD", "REC TD") if c in sample]
+        td_rate = None
+        if pos != "QB" or "RUSH TD" in sample:
+            tds = sum(sample[c].fillna(0).sum() for c in td_cols) if td_cols else 0
+            prior = NFL_TD_PRIOR.get(slot, 0.2)
+            td_rate = (tds + prior * 4) / (len(sample) + 4)
+            lam_td = td_rate * f_slot * env_factor
+            p_td, p_td_norm = 1 - math.exp(-lam_td), 1 - math.exp(-td_rate)
+            props.append({"stat": "ANYTIME TD", "line": None, "p": p_td, "p_norm": p_td_norm, "avg": td_rate})
+        main = NFL_MAIN.get(pos)
+        if main not in sim:
+            continue
+        results.append({
+            "name": r["name"], "team": team["abbr"], "role": slot, "slot": slot,
+            "questionable": bool(r.get("returning")) or is_listed(r, maybe_keys),
+            "games": n, "conf": _confidence(n, n_def, "nfl"),
+            "proj": {s: float(np.median(v)) for s, v in sim.items()},
+            "mean": {s: float(v.mean()) for s, v in sim.items()}, "normal": {s: float(v.mean()) for s, v in norm.items()},
+            "f_slot": f_slot, "env": env_factor, "props": props, "main": main,
+        })
+    return results
+
+
+def _team_sims(rng, mean_h, mean_a, sport_key):
+    sd, corr = TEAM_SD[sport_key], TEAM_CORR[sport_key]
+    z0, z1 = rng.standard_normal(SIMS), rng.standard_normal(SIMS)
+    h = mean_h + sd * z0
+    a = mean_a + sd * (corr * z0 + math.sqrt(1 - corr ** 2) * z1)
+    return h, a
+
+
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def simulate_game(sport_name, event_id, home_id, away_id):
+    """Play the game out 10,000 times. Cached for 30 minutes per game."""
+    cfg = SPORTS[sport_name]
+    key = cfg["key"]
+    nba = key == "nba"
+    teams = load_teams(cfg["site"])
+    players = load_players(cfg["site"], teams)
+    team_by_id = {t["id"]: t for t in teams}
+    home, away = team_by_id[home_id], team_by_id[away_id]
+    pos_by_id = {p["id"]: p["pos"] for p in players}
+    try:
+        injuries = load_injuries(cfg["site"])
+    except Exception:
+        injuries = {}
+    rng = np.random.default_rng(_seed(event_id))
+    try:
+        env = game_environment(cfg, sport_name, home, away, event_id)
+    except Exception:
+        env = None
+
+    rows = {tid: team_box_rows(cfg, tid, DVP_GAMES[key], pos_by_id) for tid in (home_id, away_id)}
+    frames = [r for r in rows.values() if not r.empty]
+    pool = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["game_id", "pid"]) if frames else pd.DataFrame()
+    build = nba_defense_table if nba else nfl_defense_table
+    defense, n_def = {}, {}
+    for tid in (home_id, away_id):
+        defense[tid], n_def[tid] = build(pool, rows[tid], tid) if not pool.empty else ({}, 0)
+
+    # expected points: half recent form, half the Vegas line (when there is one)
+    exp_pts, model_pts = {}, {}
+    for t, side in ((home, "proj_team"), (away, "proj_opp")):
+        form_proj = env[side] if env else None
+        implied = (env.get("implied") or {}).get(t["abbr"]) if env else None
+        model_pts[t["id"]] = form_proj
+        exp_pts[t["id"]] = (0.5 * form_proj + 0.5 * implied) if form_proj and implied else (form_proj or implied)
+    pace = {}
+    for t in (home, away):
+        form = team_form(cfg, t["id"])
+        raw = exp_pts[t["id"]] / form["for"] if form and exp_pts[t["id"]] and form["for"] else 1.0
+        pace[t["id"]] = float(min(1.08, max(0.92, raw))) if nba else float(min(1.15, max(0.85, raw)))
+
+    plist = []
+    for t, opp in ((home, away), (away, home)):
+        if nba:
+            plist += nba_players(cfg, t, players, injuries, rng, defense[opp["id"]], n_def[opp["id"]], pace[t["id"]])
+        else:
+            plist += nfl_players(cfg, sport_name, t, players, injuries, rng, defense[opp["id"]], n_def[opp["id"]], pace[t["id"]])
+
+    game = None
+    if exp_pts[home_id] and exp_pts[away_id]:
+        h, a = _team_sims(rng, exp_pts[home_id], exp_pts[away_id], key)
+        game = {"home_pts": float(np.median(h)), "away_pts": float(np.median(a)), "home_win": float((h > a).mean()),
+                "total": float(np.median(h + a)), "odds": (env or {}).get("odds")}
+        odds = game["odds"] or {}
+        if odds.get("total"):
+            game["p_over"] = float((h + a > odds["total"]).mean())
+        details = (odds.get("details") or "").split()
+        try:
+            fav, spread = details[0], abs(float(details[-1]))
+            margin = (h - a) if fav == home["abbr"] else (a - h) if fav == away["abbr"] else None
+            if margin is not None:
+                game["fav"], game["spread"], game["p_cover"] = fav, spread, float((margin > spread).mean())
+        except (ValueError, IndexError):
+            pass
+    return {"players": plist, "defense": defense, "n_def": n_def, "pace": pace, "env": env, "game": game,
+            "home": home, "away": away}
+
+
+# ---------- NFL scheme data (nflverse: play by play + FTN charting, free) ----------
+NFLVERSE = "https://github.com/nflverse/nflverse-data/releases/download/{tag}/{name}"
+ESPN_TO_NFLVERSE = {"WSH": "WAS", "LAR": "LA"}
+PBP_COLS = ("game_id", "play_id", "posteam", "defteam", "season_type", "qb_dropback", "pass_attempt", "rush",
+            "epa", "sack", "air_yards", "receiver_player_name", "pass_oe")
+FTN_COLS = ("nflverse_game_id", "nflverse_play_id", "n_blitzers", "n_pass_rushers", "is_play_action",
+            "is_motion", "is_screen_pass")
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def nflverse_parquet(tag, name, columns):
+    r = requests.get(NFLVERSE.format(tag=tag, name=name), headers=HEADERS, timeout=90)
+    r.raise_for_status()
+    pf = pq.ParquetFile(io.BytesIO(r.content))
+    wanted = [c for c in columns if c in pf.schema_arrow.names]  # only load the columns we use
+    return pf.read(columns=wanted).to_pandas()
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def nfl_scheme_tables(season):
+    """Team tendencies from every play this season: blitz rate, play action, EPA vs blitz, targets vs blitz..."""
+    pbp = nflverse_parquet("pbp", f"play_by_play_{season}.parquet", PBP_COLS)
+    try:
+        ftn = nflverse_parquet("ftn_charting", f"ftn_charting_{season}.parquet", FTN_COLS)
+        df = pbp.merge(ftn, left_on=["game_id", "play_id"], right_on=["nflverse_game_id", "nflverse_play_id"], how="left")
+    except Exception:
+        df = pbp
+        for c in FTN_COLS[2:]:
+            df[c] = np.nan
+    df = df[(df["season_type"] == "REG") & df["posteam"].notna()].copy()
+    db = df[df["qb_dropback"] == 1].copy()
+    db["blitz"] = np.where(db["n_blitzers"].notna(), db["n_blitzers"] > 0, np.nan)
+    db["deep"] = np.where(db["air_yards"].notna(), db["air_yards"] >= 20, np.nan)
+    plays = df[(df["qb_dropback"] == 1) | (df["rush"] == 1)]
+
+    def m(x):
+        x = pd.to_numeric(x, errors="coerce")
+        return float(x.mean()) if x.notna().any() else np.nan
+
+    off, deff = {}, {}
+    for team, g in db.groupby("posteam"):
+        bl = g[g["blitz"] == 1]
+        nb = g[g["blitz"] == 0]
+        off[team] = {"epa_db": m(g["epa"]), "epa_blitz": m(bl["epa"]), "epa_noblitz": m(nb["epa"]),
+                     "pa_rate": m(g["is_play_action"]), "deep_rate": m(g["deep"]), "sack_rate": m(g["sack"]),
+                     "screen_rate": m(g["is_screen_pass"]), "blitzed_rate": m(g["blitz"])}
+    for team, g in plays.groupby("posteam"):
+        off.setdefault(team, {}).update({"motion_rate": m(g["is_motion"]), "proe": m(g["pass_oe"])})
+    for team, g in db.groupby("defteam"):
+        bl = g[g["blitz"] == 1]
+        deff[team] = {"blitz_rate": m(g["blitz"]), "rushers": m(g["n_pass_rushers"]), "sack_rate": m(g["sack"]),
+                      "epa_allowed": m(g["epa"]), "epa_vs_pa": m(g[g["is_play_action"] == 1]["epa"]),
+                      "epa_vs_deep": m(g[g["deep"] == 1]["epa"]), "epa_blitzing": m(bl["epa"])}
+    off_df, def_df = pd.DataFrame(off).T, pd.DataFrame(deff).T
+    tg = db.dropna(subset=["receiver_player_name"])
+    targets = tg.groupby(["posteam", "receiver_player_name"]).agg(
+        targets=("epa", "size"), blitz_targets=("blitz", lambda x: float((x == 1).sum()))).reset_index()
+    return off_df, def_df, targets
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def nfl_coverage(season):
+    """Man vs zone and coverage shells by defense (this season if published, otherwise last season)."""
+    for s in (season, season - 1):
+        try:
+            q = nflverse_parquet("pbp_participation", f"pbp_participation_{s}.parquet",
+                                 ("nflverse_game_id", "possession_team", "defense_man_zone_type", "defense_coverage_type"))
+        except Exception:
+            continue
+        q = q[q["defense_man_zone_type"].isin(["MAN_COVERAGE", "ZONE_COVERAGE"])].copy()
+        if q.empty:
+            continue
+        parts = q["nflverse_game_id"].str.split("_")
+        away, home = parts.str[2], parts.str[3]
+        q["defteam"] = np.where(q["possession_team"] == home, away, home)
+        prof = {}
+        for team, g in q.groupby("defteam"):
+            shells = g["defense_coverage_type"].value_counts(normalize=True)
+            prof[team] = {"man": float((g["defense_man_zone_type"] == "MAN_COVERAGE").mean()),
+                          "shells": [(k.replace("_", " ").title(), float(v)) for k, v in shells.head(2).items()]}
+        return prof, s
+    return {}, None
+
+
+def _rank(df, col, team, high_is_1=True):
+    if df is None or col not in df or team not in df.index or pd.isna(df.loc[team, col]):
+        return None
+    return int(df[col].rank(ascending=not high_is_1, method="min")[team])
+
+
+def _pbp_name(full):
+    """'Amon-Ra St. Brown' -> 'astbrown', matching play by play names like 'A.St. Brown'."""
+    parts = [x for x in (full or "").replace(".", ". ").split() if _norm(x) not in ("jr", "sr", "ii", "iii", "iv")]
+    if len(parts) < 2:
+        return _norm(full)
+    return _norm(parts[0][:1] + "".join(parts[1:]))
+
+
+def nfl_scheme_lines(off_abbr, def_abbr, season, unavailable=frozenset()):
+    """Plain English scheme notes for one side of the ball."""
+    o, d = ESPN_TO_NFLVERSE.get(off_abbr, off_abbr), ESPN_TO_NFLVERSE.get(def_abbr, def_abbr)
+    try:
+        off, deff, targets = nfl_scheme_tables(season)
+    except Exception:
+        return [], {}
+    if o not in off.index or d not in deff.index:
+        return [], {}
+    O, D = off.loc[o], deff.loc[d]
+    lines, facts = [], {}
+    n_teams = len(deff)
+
+    # blitz
+    br, ob = _rank(deff, "blitz_rate", d), _rank(off, "epa_blitz", o)
+    if pd.notna(D["blitz_rate"]):
+        facts["Blitz rate"] = f'{D["blitz_rate"]:.0%} ({ordinal(br)} most)'
+        txt = f'{def_abbr} blitzes on <b>{D["blitz_rate"]:.0%}</b> of dropbacks ({ordinal(br)} most of {n_teams}).'
+        if pd.notna(O["epa_blitz"]) and ob:
+            txt += (f' {off_abbr} averages <b>{O["epa_blitz"]:+.2f} EPA</b> per dropback vs the blitz '
+                    f'({ordinal(ob)} best).')
+            if br <= 10 and ob <= 10:
+                txt += f' <span class="edge">Edge {off_abbr}</span>'
+            elif br <= 10 and ob >= n_teams - 9:
+                txt += f' <span class="edge" style="color:#B91C1C">Edge {def_abbr}</span>'
+        lines.append(txt)
+    # who gets the ball when blitzed
+    t = targets[targets["posteam"] == o]
+    if not t.empty:
+        t = t[~t["receiver_player_name"].map(_pbp_name).isin(unavailable)]
+    if not t.empty and t["blitz_targets"].sum() >= 15:
+        t = t.assign(share=t["targets"] / t["targets"].sum(), bshare=t["blitz_targets"] / t["blitz_targets"].sum())
+        t = t[t["blitz_targets"] >= 5].assign(lift=lambda x: x["bshare"] - x["share"]).sort_values("lift", ascending=False)
+        if not t.empty and t.iloc[0]["lift"] >= 0.04:
+            r = t.iloc[0]
+            lines.append(f'When blitzed, {off_abbr} looks to <b>{html.escape(r["receiver_player_name"])}</b> on '
+                         f'{r["bshare"]:.0%} of throws ({r["share"]:.0%} normally).')
+    # play action
+    pr, pe = _rank(off, "pa_rate", o), _rank(deff, "epa_vs_pa", d)
+    if pd.notna(O["pa_rate"]) and pr:
+        txt = f'{off_abbr} uses play action on <b>{O["pa_rate"]:.0%}</b> of dropbacks ({ordinal(pr)} most).'
+        if pd.notna(D["epa_vs_pa"]) and pe:
+            txt += f' {def_abbr} allows <b>{D["epa_vs_pa"]:+.2f} EPA</b> vs play action ({ordinal(pe)} most).'
+        facts["Play action"] = f'{O["pa_rate"]:.0%} ({ordinal(pr)})'
+        if pr <= 10 or (pe and pe <= 10):
+            lines.append(txt)
+    # deep shots
+    dr, de = _rank(off, "deep_rate", o), _rank(deff, "epa_vs_deep", d)
+    if pd.notna(O["deep_rate"]) and dr and de and (dr <= 10 or de <= 10):
+        lines.append(f'{off_abbr} throws deep (20+ air yards) on <b>{O["deep_rate"]:.0%}</b> of passes ({ordinal(dr)} most); '
+                     f'{def_abbr} allows <b>{D["epa_vs_deep"]:+.2f} EPA</b> on deep throws ({ordinal(de)} most).')
+    # pass rush vs protection
+    sr, osr = _rank(deff, "sack_rate", d), _rank(off, "sack_rate", o)
+    if pd.notna(D["sack_rate"]) and sr and osr:
+        facts["Sack rate"] = f'{D["sack_rate"]:.1%} ({ordinal(sr)})'
+        if sr <= 8 and osr <= 12:
+            lines.append(f'Pressure alert: {def_abbr} sacks on <b>{D["sack_rate"]:.1%}</b> of dropbacks ({ordinal(sr)} most) '
+                         f'and {off_abbr} gives up sacks on {O["sack_rate"]:.1%} ({ordinal(osr)} most).')
+    # pass heavy or run heavy
+    if pd.notna(O.get("proe", np.nan)):
+        lean = "pass heavy" if O["proe"] >= 3 else "run heavy" if O["proe"] <= -3 else "balanced"
+        facts["Pass rate vs expected"] = f'{O["proe"]:+.1f}% ({lean})'
+    if pd.notna(O.get("motion_rate", np.nan)):
+        facts["Motion"] = f'{O["motion_rate"]:.0%} of plays'
+    # coverage shells
+    cov, cov_season = nfl_coverage(season)
+    c = cov.get(d)
+    if c:
+        when = "this season" if cov_season == season else "last season"
+        shells = ", ".join(f"{n} {v:.0%}" for n, v in c["shells"])
+        facts[f"Coverage ({when})"] = f'man {c["man"]:.0%} · zone {1 - c["man"]:.0%}'
+        lines.append(f'{def_abbr} played <b>{"man" if c["man"] >= 0.5 else "zone"}</b> on '
+                     f'{max(c["man"], 1 - c["man"]):.0%} of snaps {when} (most used: {shells}).')
+    return lines, facts
+
+
+# ---------- the Game Insights page ----------
+def _who(r):
+    q = ' <span class="status s-q">Q</span>' if r["questionable"] else ""
+    return f'<b>{html.escape(r["name"])}</b> <span class="muted">{html.escape(r["team"])} · {html.escape(r["role"])}</span>{q}'
+
+
+def _conf_tag(c):
+    cls = {"High": "g-good", "Medium": "g-mid", "Low": "g-bad"}[c]
+    return f'<span class="grade {cls}" style="font-size:.62rem">{c.upper()} CONFIDENCE</span>'
+
+
+def _fmt(stat, v):
+    return f"{v:.0f}" if stat.endswith("YDS") or stat == "PRA" or stat == "PTS" else f"{v:.1f}"
+
+
+def render_game(sport_name, g):
+    cfg = SPORTS[sport_name]
+    key = cfg["key"]
+    nba = key == "nba"
+    if st.button("← Back to slate", key=f"{key}_back"):
+        st.session_state.pop(f"{key}_game", None)
+        st.rerun()
+
+    with st.spinner("Running 10,000 simulations of this game (first open takes 15 to 30 seconds)..."):
+        try:
+            res = simulate_game(sport_name, g["id"], g["home"], g["away"])
+        except Exception as e:
+            st.error(f"Couldn't run this game right now. Try again in a minute. ({e})")
+            return
+    home, away, game = res["home"], res["away"], res["game"]
+    when = _local(g["date"])
+    when_txt = f'{when.strftime("%a %b")} {when.day}, {when.strftime("%I:%M %p").lstrip("0")} ET' if when else ""
+    st.markdown(
+        f'<div class="hero" style="background:linear-gradient(110deg,#{away["color"]} 0%,#{away["color"]} 40%,'
+        f'#{home["color"]} 60%,#{home["color"]} 100%)">'
+        f'<div class="hero-side"><div class="hero-abbr">{html.escape(away["abbr"])}</div>'
+        f'<div class="hero-name">{html.escape(away["name"])}</div><div class="hero-sub">Away</div></div>'
+        f'<div class="hero-vs">@</div>'
+        f'<div class="hero-side right"><div class="hero-abbr">{html.escape(home["abbr"])}</div>'
+        f'<div class="hero-name">{html.escape(home["name"])}</div><div class="hero-sub">{when_txt}</div></div></div>',
+        unsafe_allow_html=True)
+
+    players = res["players"]
+    # ----- headline insights -----
+    lines = []
+    if game:
+        fav_home = game["home_win"] >= 0.5
+        lead, pwin = (home, game["home_win"]) if fav_home else (away, 1 - game["home_win"])
+        lines.append(f'Simulated score: <b>{away["abbr"]} {game["away_pts"]:.0f}, {home["abbr"]} {game["home_pts"]:.0f}</b>. '
+                     f'{lead["abbr"]} wins <b>{pwin:.0%}</b> of 10,000 sims.')
+        if game.get("p_over") is not None:
+            ou = game["odds"]["total"]
+            lean = "over" if game["p_over"] >= 0.5 else "under"
+            pl = game["p_over"] if lean == "over" else 1 - game["p_over"]
+            if pl < 0.53:
+                lines.append(f'Total: model {game["total"]:.1f} vs O/U {ou:.1f}. No lean, it\'s right on the number.')
+            else:
+                lines.append(f'Total: model {game["total"]:.1f} vs O/U {ou:.1f}. The {lean} hits in <b>{pl:.0%}</b> of sims.')
+        if game.get("p_cover") is not None:
+            lines.append(f'{game["fav"]} covers {game["spread"]:g} in <b>{game["p_cover"]:.0%}</b> of sims.')
+    # biggest positional weak spots
+    spots = []
+    for def_team, off_team in ((home, away), (away, home)):
+        table = res["defense"].get(def_team["id"]) or {}
+        if nba:
+            for grp, stats in table.items():
+                for s, f in stats.items():
+                    spots.append((f, f'{def_team["abbr"]} allows <b>{vs_avg(f)}</b> {s} per minute to {grp.lower()}', off_team))
+        else:
+            for slot, (f, allowed, base) in table.items():
+                if allowed and base and slot in STAR_SLOTS:
+                    spots.append((f, f'{def_team["abbr"]} allows <b>{allowed:.0f}</b> yards a game to {slot}s '
+                                     f'(avg {base:.0f}), {vs_avg(f)}', off_team))
+    for f, txt, off_team in sorted(spots, key=lambda x: x[0], reverse=True)[:2]:
+        if f >= 1.06:
+            lines.append(f'🎯 {txt}. Good spot for {off_team["abbr"]}.')
+    scheme = {}
+    if not nba:
+        season = cfg["season_fn"]()
+        try:
+            all_players, inj = load_players(cfg["site"], load_teams(cfg["site"])), load_injuries(cfg["site"])
+        except Exception:
+            all_players, inj = [], {}
+        for off_team, def_team in ((away, home), (home, away)):
+            rows = inj.get(off_team["id"]) or inj.get(off_team["name"]) or []
+            out_keys = injured_keys(rows, out=True)
+            gone = frozenset(_pbp_name(p["name"]) for p in all_players if p["team_id"] == off_team["id"]
+                             and (is_listed(p, out_keys) or status_class(p.get("inj", "")) == "s-out"))
+            gone |= frozenset(_pbp_name(r["player"]) for r in rows if status_class(r["status"]) == "s-out")
+            scheme[off_team["abbr"]] = nfl_scheme_lines(off_team["abbr"], def_team["abbr"], season, gone)
+        for abbr, (sl, _) in scheme.items():
+            lines += [f"🏈 {x}" for x in sl[:1]]
+    if lines:
+        st.markdown('<div class="insights"><div class="insights-title">💡 Game insights</div>'
+                    + "".join(f'<div class="ins-line">{l}</div>' for l in lines)
+                    + f'<div class="muted" style="margin-top:.7rem">From {SIMS:,} simulations. Scores blend recent form '
+                    f'with the Vegas line. Numbers, not guarantees.</div></div>', unsafe_allow_html=True)
+
+    # ----- players to watch -----
+    section("⭐ Players to watch", "biggest boost vs a normal night for them")
+    big = [p for p in players if (nba and p["mins_recent"] >= 24) or (not nba and p["slot"] in STAR_SLOTS)]
+    for p in big:
+        m = p["main"]
+        p["boost"] = p["mean"][m] / p["normal"][m] - 1 if p["normal"].get(m) else 0
+    watch = sorted([p for p in big if p["boost"] >= 0.03], key=lambda p: p["boost"], reverse=True)[:3]
+    cards = []
+    for p in watch:
+        m = p["main"]
+        why = []
+        if nba:
+            fd = p["f_def"].get("PTS", 1.0)
+            if abs(fd - 1) >= 0.03:
+                why.append(f'{"soft" if fd > 1 else "tough"} vs {p["group"].lower()} ({vs_avg(fd)} PTS)')
+            if p["mins_recent"] - p["mins_normal"] >= 2:
+                why.append(f'minutes up ({p["mins_recent"]:.0f} lately vs {p["mins_normal"]:.0f})')
+            if abs(p["pace"] - 1) >= 0.02:
+                why.append(f'{"fast" if p["pace"] > 1 else "slow"} game')
+        else:
+            if abs(p["f_slot"] - 1) >= 0.03:
+                why.append(f'{vs_avg(p["f_slot"])} yards allowed to {p["slot"]}s')
+            if abs(p["env"] - 1) >= 0.03:
+                why.append(f'team projected to score {"more" if p["env"] > 1 else "less"} than usual')
+        stat_txt = " · ".join(f'{s} {_fmt(s, p["proj"][s])}' for s in (["PTS", "REB", "AST", "3PM"] if nba else
+                                                                         [x for x in NFL_SIM_STATS.get(p["slot"][:2], []) if x in p["proj"]]))
+        cards.append(f'<div class="star"><div class="star-label">⭐ {html.escape(p["team"])} · {html.escape(p["role"])} '
+                     f'{_conf_tag(p["conf"])}</div><div class="star-name">{html.escape(p["name"])}'
+                     f'{" <span>Q, if he plays</span>" if p["questionable"] else ""}</div>'
+                     f'<div class="ins-line">Projected {stat_txt}. <b>{p["boost"]:+.0%}</b> {m} vs his normal night'
+                     f'{": " + ", ".join(why) if why else ""}.</div></div>')
+    st.markdown("".join(cards) or '<div class="muted">No one gets a real boost in this game. '
+                'Everyone projects close to a normal night.</div>', unsafe_allow_html=True)
+
+    # ----- best props -----
+    section("🎯 Props the numbers like", "his usual line, and how tonight moves it")
+    props = []
+    for p in players:
+        for pr in p["props"]:
+            move = pr["p"] - pr["p_norm"]
+            if abs(move) >= PROP_MIN_MOVE:
+                props.append((abs(move), p, pr, move))
+    props.sort(key=lambda x: x[0], reverse=True)
+    rows = []
+    for _, p, pr, move in props[:10]:
+        if pr["stat"] == "ANYTIME TD":
+            label, prob, normal = "Anytime TD", pr["p"], pr["p_norm"]
+        else:
+            over = move > 0
+            label = f'{"Over" if over else "Under"} {pr["line"]:g} {pr["stat"]}'
+            prob, normal = (pr["p"], pr["p_norm"]) if over else (1 - pr["p"], 1 - pr["p_norm"])
+        rows.append(f'<div class="sneaky"><div>{_who(p)}<br><span class="muted">{label} · his avg {pr["avg"]:.1f} · '
+                    f'normally hits {normal:.0%}</span> {_conf_tag(p["conf"])}</div>'
+                    + edge_pill(f"{prob:.0%}", "in sims") + '</div>')
+    st.markdown("".join(rows) or '<div class="muted">Nothing moves much in this game. The numbers say play it straight.</div>',
                 unsafe_allow_html=True)
+    st.caption("Lines here are estimated from each player's average, not real sportsbook lines. "
+               "Compare with your book: if the real line is lower than ours for an over, even better.")
+
+    # ----- defense by position -----
+    section("🛡️ Defense by position", "what each defense allows vs average (green = good for the offense)")
+    c1, c2 = st.columns(2)
+    for col, def_team in ((c1, away), (c2, home)):
+        table = res["defense"].get(def_team["id"]) or {}
+        with col:
+            st.markdown(f'<div class="inj-team">vs {html.escape(def_team["name"])} defense '
+                        f'<span class="muted">({res["n_def"].get(def_team["id"], 0):g} games)</span></div>',
+                        unsafe_allow_html=True)
+            if not table:
+                st.markdown('<div class="muted">Not enough games yet.</div>', unsafe_allow_html=True)
+                continue
+            if nba:
+                head = "".join(f"<th>{s}</th>" for s in NBA_SIM_STATS)
+                body = "".join(f'<tr><td>{grp}</td>' + "".join(
+                    f'<td class="{"up" if f >= 1.03 else "down" if f <= 0.97 else "flat"}">{(f - 1):+.0%}</td>'
+                    for f in (stats.get(s, 1.0) for s in NBA_SIM_STATS)) + "</tr>" for grp, stats in table.items())
+            else:
+                head = "<th>Yards allowed</th><th>Avg</th><th>vs avg</th>"
+                body = "".join(f'<tr><td>{slot}</td><td>{a:.0f}</td><td>{b:.0f}</td>'
+                               f'<td class="{"up" if f >= 1.03 else "down" if f <= 0.97 else "flat"}">{(f - 1):+.0%}</td></tr>'
+                               for slot, (f, a, b) in table.items() if a == a and b)
+            st.markdown(f'<table class="dmx"><tr><th></th>{head}</tr>{body}</table>', unsafe_allow_html=True)
+
+    # ----- NFL scheme report -----
+    if not nba and scheme:
+        section("🏈 Scheme report", "blitz, play action, deep shots and coverage from every play this season")
+        c1, c2 = st.columns(2)
+        for col, (abbr, (sl, facts)) in zip((c1, c2), scheme.items()):
+            other = home["abbr"] if abbr == away["abbr"] else away["abbr"]
+            with col:
+                st.markdown(f'<div class="inj-team">{html.escape(abbr)} offense vs {html.escape(other)} defense</div>'
+                            + "".join(f'<div class="ins-line">• {x}</div>' for x in sl)
+                            + "".join(f'<div class="muted">{html.escape(k)}: {html.escape(v)}</div>' for k, v in facts.items())
+                            or '<div class="muted">No charting data for this matchup yet.</div>', unsafe_allow_html=True)
+        st.caption("Play by play and charting data from nflverse (FTN charting). EPA = expected points added per play; "
+                   "higher is better for the offense.")
+
+    # ----- full projections -----
+    with st.expander("📊 Full projections for every player"):
+        for t in (away, home):
+            mine = [p for p in players if p["team"] == t["abbr"]]
+            if not mine:
+                continue
+            stats = ["PTS", "REB", "AST", "3PM", "PRA"] if nba else ["PASS YDS", "PASS TD", "RUSH YDS", "REC", "REC YDS"]
+            table = pd.DataFrame([{"Player": p["name"], "Role": p["role"], **({"Min": round(p["mins_recent"])} if nba else {}),
+                                   **{s: round(p["proj"][s], 1) for s in stats if s in p["proj"]},
+                                   "Confidence": p["conf"]} for p in mine])
+            st.markdown(f'**{t["name"]}**')
+            st.dataframe(table, hide_index=True, width="stretch")
+        st.caption("Medians from the simulations (half the sims land above, half below).")
 
 
 # ---------- ONE SPORT ----------
