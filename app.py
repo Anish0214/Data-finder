@@ -1837,14 +1837,16 @@ def nfl_players(cfg, sport_name, team, players, injuries, rng, defense, n_def, e
                               "p_norm": float((norm[s] > line).mean()), "avg": avg})
         # anytime touchdown (rushing or receiving)
         td_cols = [c for c in ("RUSH TD", "REC TD") if c in sample]
-        td_rate = None
+        td = None
         if pos != "QB" or "RUSH TD" in sample:
             tds = sum(sample[c].fillna(0).sum() for c in td_cols) if td_cols else 0
             prior = NFL_TD_PRIOR.get(slot, 0.2)
-            td_rate = (tds + prior * 4) / (len(sample) + 4)
-            lam_td = td_rate * f_slot * env_factor
-            p_td, p_td_norm = 1 - math.exp(-lam_td), 1 - math.exp(-td_rate)
-            props.append({"stat": "ANYTIME TD", "line": None, "p": p_td, "p_norm": p_td_norm, "avg": td_rate})
+            td_rate = (tds + prior * 4) / (len(sample) + 4)  # his TD rate, steadied by a typical rate for his role
+            td_sim = rng.poisson(td_rate * f_slot * env_factor, SIMS)   # touchdowns he scores in each simulated game
+            td_norm = rng.poisson(td_rate, SIMS)
+            td = {"p": float((td_sim >= 1).mean()), "p2": float((td_sim >= 2).mean()),
+                  "p_norm": float((td_norm >= 1).mean()), "per_game": float(tds / len(sample)), "games": len(sample)}
+            props.append({"stat": "ANYTIME TD", "line": None, "p": td["p"], "p_norm": td["p_norm"], "avg": td["per_game"]})
         main = NFL_MAIN.get(pos)
         if main not in sim:
             continue
@@ -1854,7 +1856,7 @@ def nfl_players(cfg, sport_name, team, players, injuries, rng, defense, n_def, e
             "games": n, "conf": _confidence(n, n_def, "nfl"),
             "proj": {s: float(np.median(v)) for s, v in sim.items()},
             "mean": {s: float(v.mean()) for s, v in sim.items()}, "normal": {s: float(v.mean()) for s, v in norm.items()},
-            "f_slot": f_slot, "env": env_factor, "props": props, "main": main,
+            "f_slot": f_slot, "env": env_factor, "props": props, "main": main, "td": td,
         })
     return results
 
@@ -2306,18 +2308,49 @@ def render_game(sport_name, g):
                    "higher is better for the offense.")
 
     # ----- full projections -----
-    with st.expander("📊 Full projections for every player"):
+    if not nba:
+        section("🏈 Touchdown odds", f"how often each player scored in {SIMS:,} simulated games")
+        scorers = sorted([p for p in players if p.get("td")], key=lambda p: p["td"]["p"], reverse=True)
+        rows = []
+        for p in scorers:
+            td = p["td"]
+            move = td["p"] - td["p_norm"]
+            arrow = "▲" if move >= 0.02 else "▼" if move <= -0.02 else "•"
+            cls = "up" if move >= 0.02 else "down" if move <= -0.02 else "flat"
+            rows.append(f'<div class="sneaky"><div>{_who(p)}<br><span class="muted">2+ TDs in {td["p2"]:.0%} of sims · '
+                        f'{td["per_game"]:.2f} TDs per game lately ({td["games"]} games) · </span>'
+                        f'<span class="delta {cls}">{arrow} {move:+.0%} vs his normal</span></div>'
+                        + edge_pill(f'{td["p"]:.0%}', "scores a TD") + '</div>')
+        st.markdown("".join(rows) or '<div class="muted">Not enough data yet.</div>', unsafe_allow_html=True)
+        st.caption("Anytime TD = rushing or receiving touchdown (QB passing TDs are in the projections below).")
+
+    with st.expander("📊 Full projections for every player", expanded=not nba):
+        role_order = list(NFL_SLOTS)
         for t in (away, home):
             mine = [p for p in players if p["team"] == t["abbr"]]
             if not mine:
                 continue
-            stats = ["PTS", "REB", "AST", "3PM", "PRA"] if nba else ["PASS YDS", "PASS TD", "RUSH YDS", "REC", "REC YDS"]
-            table = pd.DataFrame([{"Player": p["name"], "Role": p["role"], **({"Min": round(p["mins_recent"])} if nba else {}),
-                                   **{s: round(p["proj"][s], 1) for s in stats if s in p["proj"]},
-                                   "Confidence": p["conf"]} for p in mine])
+            if nba:
+                stats = ["PTS", "REB", "AST", "3PM", "PRA"]
+                mine.sort(key=lambda p: p["mins_recent"], reverse=True)
+            else:
+                stats = ["PASS YDS", "PASS TD", "RUSH YDS", "REC", "REC YDS"]
+                mine.sort(key=lambda p: role_order.index(p["role"]) if p["role"] in role_order else 99)
+            rows = []
+            for p in mine:
+                row = {"Player": p["name"], "Role": p["role"]}
+                if nba:
+                    row["Min"] = round(p["mins_recent"])
+                for s in stats:
+                    row[s] = f'{p["proj"][s]:.1f}' if s in p["proj"] else ""
+                if not nba:
+                    row["TD %"] = f'{p["td"]["p"]:.0%}' if p.get("td") else ""
+                row["Confidence"] = p["conf"]
+                rows.append(row)
             st.markdown(f'**{t["name"]}**')
-            st.dataframe(table, hide_index=True, width="stretch")
-        st.caption("Medians from the simulations (half the sims land above, half below).")
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.caption("Medians from the simulations (half the sims land above, half below). "
+                   "TD % = how often he scored at least one rushing or receiving TD.")
 
 
 # ---------- ONE SPORT ----------
