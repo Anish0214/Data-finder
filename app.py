@@ -383,6 +383,7 @@ def clean_numbers(df, sport_key):
             df["3PA"] = pd.to_numeric(df["3PT"].astype(str).str.split("-").str[1], errors="coerce")
         if "FG" in df:
             df["FGA"] = pd.to_numeric(df["FG"].astype(str).str.split("-").str[1], errors="coerce")
+            df["FGM"] = pd.to_numeric(df["FG"].astype(str).str.split("-").str[0], errors="coerce")
         if has("PTS", "REB", "AST"):
             df["PRA"] = df["PTS"] + df["REB"] + df["AST"]
     if sport_key == "nfl":
@@ -1789,6 +1790,8 @@ def nba_players(cfg, team, players, injuries, rng, defense, n_def, pace):
             "group": group,
             "questionable": questionable, "games": len(cur), "conf": _confidence(len(cur), n_def, "nba"),
             "mins_recent": mins_recent, "mins_normal": mins_normal,
+            "fgm_rate": float(cur["FGM"].fillna(0).sum() / cur["MIN"].sum()) if "FGM" in cur and cur["MIN"].sum()
+                        else float(cur["PTS"].sum() / cur["MIN"].sum() / 2.3),
             "proj": {s: float(np.median(v)) if s != "PRA" else float(v.mean()) for s, v in sim.items()},
             "mean": {s: float(v.mean()) for s, v in sim.items()}, "normal": {s: float(v.mean()) for s, v in norm.items()},
             "f_def": defense.get(group, {}), "pace": pace, "props": props, "main": "PRA",
@@ -1845,7 +1848,8 @@ def nfl_players(cfg, sport_name, team, players, injuries, rng, defense, n_def, e
             td_sim = rng.poisson(td_rate * f_slot * env_factor, SIMS)   # touchdowns he scores in each simulated game
             td_norm = rng.poisson(td_rate, SIMS)
             td = {"p": float((td_sim >= 1).mean()), "p2": float((td_sim >= 2).mean()),
-                  "p_norm": float((td_norm >= 1).mean()), "per_game": float(tds / len(sample)), "games": len(sample)}
+                  "p_norm": float((td_norm >= 1).mean()), "per_game": float(tds / len(sample)), "games": len(sample),
+                  "lam": float(td_rate * f_slot * env_factor)}
             props.append({"stat": "ANYTIME TD", "line": None, "p": td["p"], "p_norm": td["p_norm"], "avg": td["per_game"]})
         main = NFL_MAIN.get(pos)
         if main not in sim:
@@ -1867,6 +1871,72 @@ def _team_sims(rng, mean_h, mean_a, sport_key):
     h = mean_h + sd * z0
     a = mean_a + sd * (corr * z0 + math.sqrt(1 - corr ** 2) * z1)
     return h, a
+
+
+# ---------- first touchdown / first basket ----------
+NFL_TDS_PER_POINT = 0.105   # NFL teams score about 2.4 touchdowns for every 23 points
+NBA_SCORE_CHANCE = 0.45     # chance a possession ends in a made field goal
+NBA_BENCH_SHARE = 0.04      # small chance the first basket comes from someone off the bench
+
+
+def american(p):
+    """Fair odds for a probability (no sportsbook cut): 14% -> +614, 60% -> -150."""
+    if p <= 0 or p >= 1:
+        return ""
+    return f"+{100 * (1 - p) / p:.0f}" if p < 0.5 else f"-{100 * p / (1 - p):.0f}"
+
+
+def _first_row(name, team, p, player=None):
+    return {"name": name, "team": team, "p": p, "role": (player or {}).get("role", ""),
+            "questionable": bool((player or {}).get("questionable")), "conf": (player or {}).get("conf", "")}
+
+
+def first_td_sims(rng, plist, exp_pts, home, away):
+    """Every player scores touchdowns at his own rate through the game; whoever's first TD comes earliest wins."""
+    cands = []
+    for t in (home, away):
+        mine = [p for p in plist if p["team"] == t["abbr"] and p.get("td")]
+        lam_sum = sum(p["td"]["lam"] for p in mine)
+        team_tds = (exp_pts.get(t["id"]) or 0) * NFL_TDS_PER_POINT or lam_sum * 1.3
+        cands += [(p["name"], t["abbr"], p["td"]["lam"], p) for p in mine]
+        cands.append((f"Any other {t['abbr']} player / defense", t["abbr"], max(0.25, team_tds - lam_sum), None))
+    if not cands:
+        return None
+    rates = np.maximum(np.array([c[2] for c in cands]), 1e-6)
+    times = rng.exponential(1 / rates[:, None], size=(len(cands), SIMS))  # when each one's first TD would come
+    first, scored = times.argmin(axis=0), times.min(axis=0) < 1           # (1 = the full game)
+    rows = [_first_row(c[0], c[1], float(((first == i) & scored).mean()), c[3]) for i, c in enumerate(cands)]
+    team = {t["abbr"]: sum(r["p"] for r in rows if r["team"] == t["abbr"]) for t in (home, away)}
+    return {"kind": "First touchdown", "rows": sorted(rows, key=lambda r: r["p"], reverse=True),
+            "team": team, "none": float((~scored).mean())}
+
+
+def first_basket_sims(rng, plist, exp_pts, home, away, league_total):
+    """Coin flip for the tip, trade possessions until someone makes a shot, the starter who shoots it scores."""
+    lineups, make = {}, {}
+    for t in (home, away):
+        starters = sorted([p for p in plist if p["team"] == t["abbr"]], key=lambda p: p["mins_recent"], reverse=True)[:5]
+        if not starters:
+            return None
+        shares = np.array([max(p.get("fgm_rate", 0), 1e-4) for p in starters])
+        shares = shares / shares.sum() * (1 - NBA_BENCH_SHARE)
+        lineups[t["id"]] = (starters, np.append(shares, NBA_BENCH_SHARE))
+        strength = (exp_pts.get(t["id"]) or 0) / (league_total / 2) if league_total else 1.0
+        make[t["id"]] = float(min(0.52, max(0.38, NBA_SCORE_CHANCE * (strength or 1.0))))
+    ph, pa = make[home["id"]], make[away["id"]]
+    both_miss = (1 - ph) * (1 - pa)
+    home_ball_first = rng.random(SIMS) < 0.5                                  # who wins the tip
+    p_home_scores_first = np.where(home_ball_first, ph / (1 - both_miss), (1 - pa) * ph / (1 - both_miss))
+    home_first = rng.random(SIMS) < p_home_scores_first
+    rows = []
+    for t, mask in ((home, home_first), (away, ~home_first)):
+        starters, shares = lineups[t["id"]]
+        pick = rng.choice(len(shares), size=int(mask.sum()), p=shares)
+        for i, p in enumerate(starters):
+            rows.append(_first_row(p["name"], t["abbr"], float((pick == i).sum() / SIMS), p))
+        rows.append(_first_row(f"Any {t['abbr']} bench player", t["abbr"], float((pick == len(starters)).sum() / SIMS)))
+    team = {home["abbr"]: float(home_first.mean()), away["abbr"]: float((~home_first).mean())}
+    return {"kind": "First basket", "rows": sorted(rows, key=lambda r: r["p"], reverse=True), "team": team, "none": None}
 
 
 @st.cache_data(ttl=30 * 60, show_spinner=False)
@@ -1934,8 +2004,11 @@ def simulate_game(sport_name, event_id, home_id, away_id):
                 game["fav"], game["spread"], game["p_cover"] = fav, spread, float((margin > spread).mean())
         except (ValueError, IndexError):
             pass
+    league_total = (env or {}).get("league")
+    first = (first_basket_sims(rng, plist, exp_pts, home, away, league_total) if nba
+             else first_td_sims(rng, plist, exp_pts, home, away))
     return {"players": plist, "defense": defense, "n_def": n_def, "pace": pace, "env": env, "game": game,
-            "home": home, "away": away}
+            "home": home, "away": away, "first": first}
 
 
 # ---------- NFL scheme data (nflverse: play by play + FTN charting, free) ----------
@@ -2308,6 +2381,29 @@ def render_game(sport_name, g):
                    "higher is better for the offense.")
 
     # ----- full projections -----
+    first = res.get("first")
+    if first and first["rows"]:
+        section(f"🥇 {first['kind']}", f"who scored first in {SIMS:,} simulated games")
+        players_only = [r for r in first["rows"] if r["role"]]
+        top2 = players_only[:2]
+        st.markdown("".join(
+            f'<div class="star"><div class="star-label">🥇 Look at #{i} · {html.escape(r["team"])} · {html.escape(r["role"])}'
+            f'{" · Q" if r["questionable"] else ""}</div><div class="star-name">{html.escape(r["name"])}</div>'
+            f'<div class="ins-line">{first["kind"]} in <b>{r["p"]:.1%}</b> of sims · fair odds <b>{american(r["p"])}</b></div></div>'
+            for i, r in enumerate(top2, 1)), unsafe_allow_html=True)
+        rest = [r for r in first["rows"] if r not in top2][:8]
+        st.markdown("".join(
+            f'<div class="sneaky"><div><b>{html.escape(r["name"])}</b> <span class="muted">{html.escape(r["team"])}'
+            f'{" · " + html.escape(r["role"]) if r["role"] else ""}</span></div>'
+            + edge_pill(f'{r["p"]:.1%}', f'fair {american(r["p"])}') + '</div>' for r in rest), unsafe_allow_html=True)
+        team_txt = " · ".join(f'{abbr} scores first {p:.0%}' for abbr, p in first["team"].items())
+        none_txt = f' · No touchdown {first["none"]:.1%}' if first.get("none") is not None else ""
+        st.markdown(f'<div class="muted" style="margin-top:.4rem">{team_txt}{none_txt}</div>', unsafe_allow_html=True)
+        st.caption("Fair odds = the price that matches the sim probability, with no sportsbook cut. If your book offers a "
+                   "bigger number (say +900 when fair is +700), the numbers like it. "
+                   + ("First basket = first made field goal; starters are projected from recent minutes and the tip is a coin flip."
+                      if nba else "First TD counts rushing or receiving touchdowns, plus any other player or the defense."))
+
     if not nba:
         section("🏈 Touchdown odds", f"how often each player scored in {SIMS:,} simulated games")
         scorers = sorted([p for p in players if p.get("td")], key=lambda p: p["td"]["p"], reverse=True)
