@@ -829,14 +829,15 @@ ENV_GAMES = {"nba": 10, "nfl": 8}
 ENV_EDGE = 0.04  # 4% above/below the league's average total = high/low scoring
 
 
-def team_form(cfg, team_id):
-    """Average points scored and allowed over the team's recent games."""
+def team_form(cfg, team_id, as_of=None):
+    """Average points scored and allowed over the team's recent games (before `as_of`, if given)."""
     current = cfg["season_fn"]()
     games = []
     for season in (current, current - 1):
         try:
             games += [g for g in load_completed_games(cfg["site"], team_id, season)
-                      if g.get("pts_for") is not None and g.get("pts_against") is not None]
+                      if g.get("pts_for") is not None and g.get("pts_against") is not None
+                      and (not as_of or g["date"] < as_of)]
         except Exception:
             pass
         if len(games) >= 3:
@@ -892,8 +893,8 @@ def implied_totals(total, details, team_abbr, opp_abbr):
     return {fav: (total + spread) / 2, dog: (total - spread) / 2}
 
 
-def game_environment(cfg, sport_name, team, opp, event_id=None):
-    a, b = team_form(cfg, team["id"]), team_form(cfg, opp["id"])
+def game_environment(cfg, sport_name, team, opp, event_id=None, as_of=None):
+    a, b = team_form(cfg, team["id"], as_of), team_form(cfg, opp["id"], as_of)
     if not a or not b:
         return None
     env = {
@@ -1538,14 +1539,13 @@ def render_slate(sport_name):
 # so a prop only shows up when tonight's numbers actually move it.
 # ==========================================================
 SIMS = 10_000
-SHRINK_GAMES = {"nba": 8, "nfl": 5}          # a defense needs this many games before we fully trust it
-FACTOR_CAP = {"nba": (0.85, 1.18), "nfl": (0.80, 1.25)}
+SHRINK_GAMES = {"nba": 15, "nfl": 5}         # a defense needs this many games before we fully trust it (NBA position splits are noisy)
+FACTOR_CAP = {"nba": (0.90, 1.10), "nfl": (0.80, 1.25)}
 TEAM_SD = {"nba": 12.0, "nfl": 10.0}         # how much a team's score swings game to game
 TEAM_CORR = {"nba": 0.30, "nfl": 0.15}       # fast games lift both teams
 PROP_MIN_MOVE = 0.04                         # a prop needs to move 4+ points of probability to be listed
 
 NBA_SIM_STATS = ["PTS", "REB", "AST", "3PM"]
-NBA_DISPERSION = {"PTS": 2.2, "REB": 1.3, "AST": 1.4, "3PM": 1.25}   # how streaky each stat is
 NBA_PACE_WEIGHT = {"PTS": 1.0, "3PM": 1.0, "AST": 0.7, "REB": 0.4}
 NBA_PROP_MIN = {"PTS": 8, "REB": 3, "AST": 2, "3PM": 0.8, "PRA": 15}
 NBA_SIM_MIN_MINUTES = 14
@@ -1606,13 +1606,13 @@ def ordinal(n):
 
 
 # ---------- box scores for both teams (defense vs position + league baseline) ----------
-def team_box_rows(cfg, team_id, n_games, pos_by_id):
+def team_box_rows(cfg, team_id, n_games, pos_by_id, as_of=None):
     """Every player line from a team's last n games (both sides). This season counts full, last season half."""
     current = cfg["season_fn"]()
     games = []
     for season in (current, current - 1):
         try:
-            got = load_completed_games(cfg["site"], team_id, season)
+            got = [g for g in load_completed_games(cfg["site"], team_id, season) if not as_of or g["date"] < as_of]
         except Exception:
             got = []
         games += [{**g, "weight": 1.0 if season == current else 0.5} for g in got]
@@ -1629,12 +1629,12 @@ def team_box_rows(cfg, team_id, n_games, pos_by_id):
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(one, games))
     frames = []
-    for g, box in results:
+    for order, (g, box) in enumerate(results):
         if not box:
             continue
         df = _clean_box(pd.DataFrame(box), cfg["key"])
         df["pos"] = [p or pos_by_id.get(pid, "") for p, pid in zip(df["pos"], df["pid"])]
-        df["game_id"], df["weight"] = g["id"], g["weight"]
+        df["game_id"], df["weight"], df["g_order"] = g["id"], g["weight"], order  # g_order 0 = most recent
         frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
@@ -1699,6 +1699,21 @@ def nfl_defense_table(pool, def_rows, def_id):
 
 
 # ---------- players ----------
+def team_game_ids(cfg, team_id, as_of=None):
+    """(date, opponent id) of every game a team has finished this season (before `as_of`, if given).
+    A player's game counts for this team if it's on one of these dates against the same opponent."""
+    try:
+        return frozenset((g["date"], g["other_id"]) for g in load_completed_games(cfg["site"], team_id, cfg["season_fn"]())
+                         if not as_of or g["date"] < as_of)
+    except Exception:
+        return frozenset()
+
+
+def _with_team(df, ids):
+    """True for each game log row played for the team whose games are `ids`."""
+    return pd.Series([(d, o) in ids for d, o in zip(df["Date"], df["opp_id"])], index=df.index, dtype=bool)
+
+
 def _player_sample(cfg, p, team_id, n):
     """His last n games THIS season with his current team, plus last season as a light prior."""
     current = cfg["season_fn"]()
@@ -1706,8 +1721,11 @@ def _player_sample(cfg, p, team_id, n):
     prev = load_gamelog(cfg["web"], p["id"], current - 1, cfg["season_label"](current - 1), cfg["use_names"])
     cur = clean_numbers(cur, cfg["key"]) if not cur.empty else cur
     prev = clean_numbers(prev, cfg["key"]) if not prev.empty else prev
-    if not cur.empty and "team_id" in cur and cur["team_id"].astype(bool).any():
-        cur = cur[cur["team_id"] == team_id]  # traded? only count games for this team
+    ids = team_game_ids(cfg, team_id)
+    if not cur.empty and "opp_id" in cur and ids and _with_team(cur, ids).any():
+        cur = cur[_with_team(cur, ids)]  # traded? only count games he played for THIS team
+    elif not cur.empty and "team_id" in cur and cur["team_id"].astype(bool).any():
+        cur = cur[cur["team_id"] == team_id]
     if not cur.empty:
         cur = cur.sort_values("Date", ascending=False).head(n)
     if not prev.empty:
@@ -1729,74 +1747,6 @@ def _confidence(n_player, n_def, sport_key):
     if n_player >= mid[0] and n_def >= mid[1]:
         return "Medium"
     return "Low"
-
-
-def nba_players(cfg, team, players, injuries, rng, defense, n_def, pace):
-    inj = injuries.get(team["id"]) or injuries.get(team["name"]) or []
-    out_keys, maybe_keys = injured_keys(inj, out=True), injured_keys(inj, out=False)
-    roster = [p for p in players if p["team_id"] == team["id"] and not is_listed(p, out_keys)
-              and status_class(p.get("inj", "")) != "s-out"]
-    try:  # must have played in one of the team's last 3 games (catches injuries the feed missed)
-        recent_team = load_completed_games(cfg["site"], team["id"], cfg["season_fn"]())
-        cutoff = recent_team[min(2, len(recent_team) - 1)]["date"] if recent_team else ""
-    except Exception:
-        cutoff = ""
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        samples = list(pool.map(lambda p: (p, *_player_sample(cfg, p, team["id"], 10)), roster))
-    results = []
-    for p, cur, prev in samples:
-        if cur.empty or "MIN" not in cur:
-            continue
-        cur = cur[cur["MIN"].fillna(0) > 0]
-        if cur.empty:
-            continue
-        questionable = is_listed(p, maybe_keys)
-        if cutoff and cur["Date"].max() < cutoff and not questionable:
-            continue
-        mins_recent, mins_normal = cur.head(5)["MIN"].mean(), cur["MIN"].mean()
-        if mins_recent < NBA_SIM_MIN_MINUTES:
-            continue
-        mins_sd = max(3.5, float(cur["MIN"].std(ddof=0) or 0))
-        prev_ok = not prev.empty and "MIN" in prev and (prev["MIN"].fillna(0) > 0).sum() >= 10
-        group = NBA_GROUP_OF.get(p["pos"], "Forwards")
-        mins = np.clip(rng.normal(mins_recent, mins_sd, SIMS), 0, 46)
-        mins_n = np.clip(rng.normal(mins_normal, mins_sd, SIMS), 0, 46)
-        sim, norm, rates = {}, {}, {}
-        for s in NBA_SIM_STATS:
-            if s not in cur:
-                continue
-            rate = _blend_rate(cur[s].fillna(0).sum(), cur["MIN"].sum(),
-                               prev[s].fillna(0).sum() if prev_ok and s in prev else 0,
-                               prev["MIN"].fillna(0).sum() if prev_ok else 0, 5 * mins_normal if prev_ok else 0)
-            rates[s] = rate
-            f_def = defense.get(group, {}).get(s, 1.0)
-            f_pace = 1 + NBA_PACE_WEIGHT[s] * (pace - 1)
-            sim[s] = _nb(rng, rate * mins * f_def * f_pace, NBA_DISPERSION[s])
-            norm[s] = _nb(rng, rate * mins_n, NBA_DISPERSION[s])
-        if not {"PTS", "REB", "AST"} <= set(sim):
-            continue
-        sim["PRA"] = sim["PTS"] + sim["REB"] + sim["AST"]
-        norm["PRA"] = norm["PTS"] + norm["REB"] + norm["AST"]
-        avgs = {s: float(cur[s].mean()) for s in NBA_SIM_STATS if s in cur}
-        avgs["PRA"] = float((cur["PTS"] + cur["REB"] + cur["AST"]).mean())
-        props = []
-        for s in NBA_SIM_STATS + ["PRA"]:
-            if s in sim and avgs.get(s, 0) >= NBA_PROP_MIN[s]:
-                line = book_line(avgs[s], s)
-                props.append({"stat": s, "line": line, "p": float((sim[s] > line).mean()),
-                              "p_norm": float((norm[s] > line).mean()), "avg": avgs[s]})
-        results.append({
-            "name": p["name"], "team": team["abbr"], "role": f'{p["pos"]} · {group[:-1]}' if p["pos"] else group[:-1],
-            "group": group,
-            "questionable": questionable, "games": len(cur), "conf": _confidence(len(cur), n_def, "nba"),
-            "mins_recent": mins_recent, "mins_normal": mins_normal,
-            "fgm_rate": float(cur["FGM"].fillna(0).sum() / cur["MIN"].sum()) if "FGM" in cur and cur["MIN"].sum()
-                        else float(cur["PTS"].sum() / cur["MIN"].sum() / 2.3),
-            "proj": {s: float(np.median(v)) if s != "PRA" else float(v.mean()) for s, v in sim.items()},
-            "mean": {s: float(v.mean()) for s, v in sim.items()}, "normal": {s: float(v.mean()) for s, v in norm.items()},
-            "f_def": defense.get(group, {}), "pace": pace, "props": props, "main": "PRA",
-        })
-    return results
 
 
 def nfl_players(cfg, sport_name, team, players, injuries, rng, defense, n_def, env_factor):
@@ -1939,9 +1889,275 @@ def first_basket_sims(rng, plist, exp_pts, home, away, league_total):
     return {"kind": "First basket", "rows": sorted(rows, key=lambda r: r["p"], reverse=True), "team": team, "none": None}
 
 
+# ---------- NBA model v2 ----------
+# What changed vs v1 (and why):
+#  * Only games for his CURRENT team count (trades), with older data as a light starting point.
+#  * Recent games count more than old ones (role changes show up fast).
+#  * A rotation player who is newly OUT frees up minutes and shots; teammates absorb them,
+#    same position first.
+#  * Back to backs, home court and blowouts (stars sit in lopsided sims) change minutes.
+#  * Each player's points are tied to his team's simulated score, so a team that scores 125 in a sim
+#    lifts its players together (props on the same team move together, like real games).
+#  * Team totals are anchored to the expected score (recent form + Vegas), so the position matchups
+#    decide WHO gets the points while the team total stays realistic.
+NBA_DECAY = 0.88            # each older game counts 12% less than the one after it
+NBA_MIN_DECAY = 0.80        # minutes react even faster to recent games
+NBA_PRIOR_GAMES = 6         # older data (last season / old team) is worth about 6 recent games
+NBA_HOME_EDGE = 0.01        # home teams score ~1% more
+NBA_B2B_TEAM = 0.985        # second night of a back to back: team scores ~1.5% less
+NBA_B2B_OPP = 1.01          # ...and the opponent ~1% more
+NBA_B2B_MIN = 0.97          # heavy minute players lose a bit of playing time on a back to back
+NBA_ABSORB_MIN = 0.85       # share of a missing player's minutes that goes to rotation players
+NBA_ABSORB = {"PTS": 0.6, "3PM": 0.55, "AST": 0.6, "REB": 0.8}  # share of his production teammates pick up
+NBA_SHOCK_EXP = {"PTS": 1.0, "3PM": 0.8, "AST": 0.6, "REB": 0.15}  # how much a high scoring sim lifts each stat
+NBA_DISPERSION_V2 = {"PTS": 1.8, "REB": 1.25, "AST": 1.3, "3PM": 1.2}  # less, since the team shock adds swing
+NBA_BLOWOUT_START = 12      # in sims decided by more than this, starters sit late
+NBA_BLOWOUT_PER_PT = 0.012  # minutes lost per extra point of margin (starters)
+
+
+def _blowout_factor(margin):
+    return np.clip(1 - NBA_BLOWOUT_PER_PT * np.maximum(0, np.abs(margin) - NBA_BLOWOUT_START), 0.75, 1.0)
+
+
+# A starter's average minutes already include his usual share of blowouts, so we only adjust for games that
+# project MORE (or less) lopsided than a typical NBA game (final margins swing about 15 points either way).
+NBA_BLOWOUT_TYPICAL = float(_blowout_factor(np.random.default_rng(1).normal(0, 15, 200_000)).mean())
+NBA_MIN_CAP = 42
+NBA_ABSORB_MAX = 6
+# How much a player's per minute production swings game to game. With few games we don't know his true
+# average exactly, so each sim also nudges it: wider for small samples, tighter for big ones.
+NBA_RATE_CV = {"PTS": 0.30, "REB": 0.30, "AST": 0.35, "3PM": 0.55}          # no one picks up more than 6 extra minutes from a single missing teammate
+
+
+def _wmean(vals, decay):
+    v = np.asarray(vals, dtype=float)
+    if len(v) == 0:
+        return 0.0
+    w = decay ** np.arange(len(v))
+    return float((v * w).sum() / w.sum())
+
+
+def _nba_sample(cfg, pid, team_id, as_of, ids):
+    """(games with this team, newest first) and (older games: other teams this season + last season)."""
+    current = cfg["season_fn"]()
+    cur = load_gamelog(cfg["web"], pid, current, cfg["season_label"](current), cfg["use_names"])
+    prev = load_gamelog(cfg["web"], pid, current - 1, cfg["season_label"](current - 1), cfg["use_names"])
+    cur = clean_numbers(cur, "nba") if not cur.empty else cur
+    prev = clean_numbers(prev, "nba") if not prev.empty else prev
+    if as_of:
+        cur = cur[cur["Date"] < as_of] if not cur.empty else cur
+        prev = prev[prev["Date"] < as_of] if not prev.empty else prev
+    if not cur.empty and "opp_id" in cur and ids:
+        flag = _with_team(cur, ids)
+        mine, other = cur[flag], cur[~flag]
+    else:
+        mine, other = cur, cur.iloc[0:0] if not cur.empty else cur
+    older = pd.concat([f for f in (other, prev) if not f.empty], ignore_index=True) if (not other.empty or not prev.empty) \
+        else pd.DataFrame()
+
+    def played(df):
+        return df[df["MIN"].fillna(0) > 0].sort_values("Date", ascending=False) if not df.empty and "MIN" in df else df.iloc[0:0]
+    return played(mine), played(older), len(played(other))
+
+
+def nba_absences(team_rows, team_id, missing_ids):
+    """Rotation players (15+ min in 2 of the team's last 3 games) who are out tonight.
+    Long term absences are already baked into everyone's recent numbers, so only NEW absences count."""
+    if team_rows is None or team_rows.empty or "MIN" not in team_rows:
+        return []
+    own = team_rows[team_rows["team_id"] == team_id]
+    recent = own[own["g_order"] < 3]
+    rot = recent[recent["MIN"].fillna(0) >= 15].groupby("pid").size()
+    out = []
+    for pid in rot[rot >= 2].index:
+        if pid not in missing_ids:
+            continue
+        mine = own[(own["pid"] == pid) & (own["g_order"] < 5) & (own["MIN"].fillna(0) > 0)]
+        mins = float(mine["MIN"].mean())
+        rates = {s: float(mine[s].fillna(0).sum() / mine["MIN"].sum()) for s in NBA_SIM_STATS if s in mine}
+        out.append({"pid": pid, "name": mine["Player"].iloc[0], "group": NBA_GROUP_OF.get(mine["pos"].iloc[0], "Forwards"),
+                    "mins": mins, "rates": rates})
+    return out
+
+
+def nba_players_v2(cfg, team, roster, missing_ids, maybe_ids, rng, defense, n_def, ctx):
+    """Projections for one team. ctx: as_of, team_rows, exp_pts, form_for, b2b, opp_b2b, home,
+    shock (team score per sim / expected), margin (this team's margin per sim), live."""
+    as_of, ids = ctx["as_of"], team_game_ids(cfg, team["id"], ctx["as_of"])
+    try:
+        recent_team = sorted((g for g in load_completed_games(cfg["site"], team["id"], cfg["season_fn"]())
+                              if not as_of or g["date"] < as_of), key=lambda g: g["date"], reverse=True)
+        cutoff = recent_team[min(2, len(recent_team) - 1)]["date"] if recent_team else ""
+    except Exception:
+        cutoff = ""
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        samples = list(pool.map(lambda p: (p, *_nba_sample(cfg, p["id"], team["id"], as_of, ids)), roster))
+
+    # ---- 1) baselines: minutes and per minute rates, recent games weighted more ----
+    base = []
+    for p, mine, older, n_other in samples:
+        questionable = p["id"] in maybe_ids
+        new_team = n_other > 0 and len(mine) < 8
+        if mine.empty and older.empty:
+            continue
+        if mine.empty:  # just traded and hasn't suited up yet: lean on his old numbers
+            if older.empty or older["Date"].iloc[0] < (cutoff or "0000"):
+                continue
+            mins_base = _wmean(older["MIN"].head(10), NBA_MIN_DECAY) * 0.9
+        else:
+            if ctx["live"] and cutoff and mine["Date"].iloc[0] < cutoff and not questionable:
+                continue  # hasn't played lately and isn't listed: probably hurt or out of the rotation
+            mins_base = _wmean(mine["MIN"].head(10), NBA_MIN_DECAY)
+            if len(mine) < 3 and not older.empty:  # tiny sample: blend with his older minutes
+                k = len(mine) / 3
+                mins_base = k * mins_base + (1 - k) * _wmean(older["MIN"].head(10), NBA_MIN_DECAY)
+        if mins_base < NBA_SIM_MIN_MINUTES:
+            continue
+        older_ok = not older.empty and len(older) >= 5
+        rates = {}
+        for s in NBA_SIM_STATS:
+            src_ok = not mine.empty and s in mine
+            w = NBA_DECAY ** np.arange(len(mine)) if src_ok else np.array([])
+            num = float((mine[s].fillna(0).to_numpy() * w).sum()) if src_ok else 0.0
+            den = float((mine["MIN"].to_numpy() * w).sum()) if src_ok else 0.0
+            prior_min = NBA_PRIOR_GAMES * 0.6 * mins_base
+            if older_ok and s in older and older["MIN"].sum():
+                prior_rate = older[s].fillna(0).sum() / older["MIN"].sum()
+                rates[s] = (num + prior_rate * prior_min) / (den + prior_min)
+            else:
+                rates[s] = num / den if den else 0.0
+        group = NBA_GROUP_OF.get(p["pos"], "Forwards")
+        eff_n = float((NBA_DECAY ** np.arange(len(mine))).sum()) + (NBA_PRIOR_GAMES * 0.6 if older_ok else 0)
+        eff_n_min = float((NBA_MIN_DECAY ** np.arange(min(len(mine), 10))).sum()) or 1.0
+        avg_src = mine if len(mine) >= 3 else pd.concat([mine, older.head(10)], ignore_index=True)
+        base.append({"p": p, "group": group, "mins": mins_base, "mins_normal": float(avg_src["MIN"].mean()),
+                     "mins_sd": max(3.5, float(avg_src["MIN"].head(15).std(ddof=0) or 0)), "rates": rates,
+                     "questionable": questionable, "new_team": new_team, "games": len(mine),
+                     "eff_n": max(eff_n, 1.0), "eff_n_min": eff_n_min,
+                     "avg_src": avg_src, "notes": [], "usage": {s: 1.0 for s in NBA_SIM_STATS}})
+    if not base:
+        return []
+
+    # ---- 2) newly missing rotation players: hand their minutes and shots to teammates ----
+    absent = nba_absences(ctx["team_rows"], team["id"], missing_ids)
+    for a in absent:
+        weights = np.array([b["mins"] * (2.0 if b["group"] == a["group"] else 1.0) for b in base])
+        extra = a["mins"] * NBA_ABSORB_MIN * weights / weights.sum()
+        gained = {s: 0.0 for s in NBA_SIM_STATS}
+        for b, e in zip(base, extra):
+            e = min(e, NBA_ABSORB_MAX, max(0.0, NBA_MIN_CAP - b["mins"]))
+            b["mins"] += e
+            for s in NBA_SIM_STATS:
+                gained[s] += b["rates"].get(s, 0) * e
+            if e >= 1.5:
+                b["notes"].append(f'+{e:.0f} min with {short_name(a["name"])} out')
+        for s in NBA_SIM_STATS:
+            left = max(0.0, a["rates"].get(s, 0) * a["mins"] * NBA_ABSORB[s] - gained[s])
+            if left <= 0:
+                continue
+            prod = np.array([b["rates"].get(s, 0) * b["mins"] * (1.5 if b["group"] == a["group"] else 1.0) for b in base])
+            if prod.sum() <= 0:
+                continue
+            for b, share in zip(base, prod / prod.sum()):
+                cur = b["rates"].get(s, 0) * b["mins"]
+                if cur > 0:
+                    b["usage"][s] *= 1 + left * share / cur
+        for b in base:
+            if b["usage"]["PTS"] >= 1.06 and not any("more shots" in n for n in b["notes"]):
+                b["notes"].append(f'more shots with {short_name(a["name"])} out')
+
+    # ---- 3) game context: rest, home court, matchup by position ----
+    for b in base:
+        if ctx["b2b"] and b["mins"] >= 30:
+            b["mins"] *= NBA_B2B_MIN
+        f_def = defense.get(b["group"], {})
+        b["f_def"] = f_def
+        b["exp"] = {s: b["rates"].get(s, 0) * b["usage"][s] * b["mins"] * f_def.get(s, 1.0) for s in NBA_SIM_STATS}
+    if ctx["b2b"]:
+        for b in base:
+            if b["mins"] >= 24:
+                b["notes"].append("2nd night of a back to back")
+
+    # ---- 4) anchor the team total: position matchups decide WHO scores, the team projection decides HOW MUCH ----
+    sim_pts = sum(b["exp"]["PTS"] for b in base)
+    anchor = 1.0
+    team_rows = ctx["team_rows"]
+    if ctx["exp_pts"] and sim_pts > 0 and team_rows is not None and not team_rows.empty and "PTS" in team_rows:
+        own = team_rows[(team_rows["team_id"] == team["id"]) & (team_rows["g_order"] < 5)]
+        tot = own["PTS"].fillna(0).sum()
+        rot = own[own["MIN"].fillna(0) >= NBA_SIM_MIN_MINUTES]["PTS"].fillna(0).sum()
+        coverage = float(min(1.0, max(0.75, rot / tot))) if tot else 0.9
+        anchor = float(min(1.12, max(0.88, ctx["exp_pts"] * coverage / sim_pts)))
+    for b in base:
+        b["exp"]["PTS"] *= anchor
+        b["exp"]["3PM"] *= anchor
+        b["exp"]["AST"] *= anchor ** 0.6
+
+    # ---- 5) simulate ----
+    shock, margin = ctx["shock"], ctx["margin"]
+    norm_shock = np.clip(1 + rng.normal(0, TEAM_SD["nba"] / max(ctx["form_for"] or 112, 80), SIMS), 0.75, 1.25)
+    results = []
+    for b in base:
+        p = b["p"]
+        mins_sd = math.sqrt(b["mins_sd"] ** 2 + b["mins_sd"] ** 2 / b["eff_n_min"])  # game swing + not knowing his true minutes
+        mins = np.clip(rng.normal(b["mins"], mins_sd, SIMS), 0, 46)
+        if margin is not None and b["mins"] >= 28:  # starters sit in blowouts (vs his usual blowout share)
+            mins *= _blowout_factor(margin) / NBA_BLOWOUT_TYPICAL
+        mins_n = np.clip(rng.normal(b["mins_normal"], mins_sd, SIMS), 0, 46)
+        sim, norm = {}, {}
+        for s in NBA_SIM_STATS:
+            err = NBA_RATE_CV[s] / math.sqrt(b["eff_n"])            # how unsure we are of his true rate
+            unsure = np.exp(rng.normal(-err ** 2 / 2, err, SIMS))   # averages to 1, wider for small samples
+            per_min = b["exp"][s] / b["mins"] if b["mins"] else 0
+            lam = per_min * unsure * mins * (shock ** NBA_SHOCK_EXP[s] if shock is not None else 1.0)
+            sim[s] = _nb(rng, lam, NBA_DISPERSION_V2[s])
+            unsure_n = np.exp(rng.normal(-err ** 2 / 2, err, SIMS))
+            norm[s] = _nb(rng, b["rates"].get(s, 0) * unsure_n * mins_n * norm_shock ** NBA_SHOCK_EXP[s],
+                          NBA_DISPERSION_V2[s])
+        sim["PRA"] = sim["PTS"] + sim["REB"] + sim["AST"]
+        norm["PRA"] = norm["PTS"] + norm["REB"] + norm["AST"]
+        src = b["avg_src"]
+        avgs = {s: float(src[s].mean()) for s in NBA_SIM_STATS if s in src}
+        avgs["PRA"] = avgs.get("PTS", 0) + avgs.get("REB", 0) + avgs.get("AST", 0)
+        props = []
+        for s in NBA_SIM_STATS + ["PRA"]:
+            if avgs.get(s, 0) >= NBA_PROP_MIN[s]:
+                line = book_line(avgs[s], s)
+                props.append({"stat": s, "line": line, "p": float((sim[s] > line).mean()),
+                              "p_norm": float((norm[s] > line).mean()), "avg": avgs[s]})
+        conf = _confidence(b["games"], n_def, "nba")
+        if b["new_team"]:
+            b["notes"].insert(0, "new team, small sample")
+            conf = "Low" if b["games"] < 5 else conf
+        fgm = (src["FGM"].fillna(0).sum() / src["MIN"].sum()) if "FGM" in src and src["MIN"].sum() else \
+              (src["PTS"].sum() / src["MIN"].sum() / 2.3 if src["MIN"].sum() else 0.2)
+        results.append({
+            "id": p["id"], "name": p["name"], "team": team["abbr"], "group": b["group"],
+            "role": f'{p["pos"]} · {b["group"][:-1]}' if p["pos"] else b["group"][:-1],
+            "questionable": b["questionable"], "games": b["games"], "conf": conf, "new_team": b["new_team"],
+            "mins_recent": b["mins"], "mins_normal": b["mins_normal"], "fgm_rate": float(fgm),
+            "proj": {s: float(np.median(v)) if s != "PRA" else float(v.mean()) for s, v in sim.items()},
+            "mean": {s: float(v.mean()) for s, v in sim.items()}, "normal": {s: float(v.mean()) for s, v in norm.items()},
+            "f_def": b["f_def"], "pace": ctx["pace"], "props": props, "main": "PRA", "notes": b["notes"],
+        })
+    return results
+
+
+def _b2b(cfg, team_id, game_date):
+    """Did this team play the day before `game_date` (UTC dates, like ESPN)?"""
+    if not game_date:
+        return False
+    try:
+        day_before = (dt.date.fromisoformat(game_date) - dt.timedelta(days=1)).isoformat()
+        return any(g["date"] == day_before for g in load_completed_games(cfg["site"], team_id, cfg["season_fn"]()))
+    except Exception:
+        return False
+
+
 @st.cache_data(ttl=30 * 60, show_spinner=False)
-def simulate_game(sport_name, event_id, home_id, away_id):
-    """Play the game out 10,000 times. Cached for 30 minutes per game."""
+def simulate_game(sport_name, event_id, home_id, away_id, game_date=None, as_of=None, played=None):
+    """Play the game out 10,000 times. Cached for 30 minutes per game.
+    as_of + played are for the Model check: only use data from before the game, and the players who actually played."""
     cfg = SPORTS[sport_name]
     key = cfg["key"]
     nba = key == "nba"
@@ -1950,17 +2166,21 @@ def simulate_game(sport_name, event_id, home_id, away_id):
     team_by_id = {t["id"]: t for t in teams}
     home, away = team_by_id[home_id], team_by_id[away_id]
     pos_by_id = {p["id"]: p["pos"] for p in players}
-    try:
-        injuries = load_injuries(cfg["site"])
-    except Exception:
-        injuries = {}
+    if played:
+        pos_by_id.update({pid: pos for pid, _, pos, _ in played if pos})
+    injuries = {}
+    if not as_of:
+        try:
+            injuries = load_injuries(cfg["site"])
+        except Exception:
+            injuries = {}
     rng = np.random.default_rng(_seed(event_id))
     try:
-        env = game_environment(cfg, sport_name, home, away, event_id)
+        env = game_environment(cfg, sport_name, home, away, event_id, as_of=as_of)
     except Exception:
         env = None
 
-    rows = {tid: team_box_rows(cfg, tid, DVP_GAMES[key], pos_by_id) for tid in (home_id, away_id)}
+    rows = {tid: team_box_rows(cfg, tid, DVP_GAMES[key], pos_by_id, as_of) for tid in (home_id, away_id)}
     frames = [r for r in rows.values() if not r.empty]
     pool = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["game_id", "pid"]) if frames else pd.DataFrame()
     build = nba_defense_table if nba else nfl_defense_table
@@ -1968,31 +2188,63 @@ def simulate_game(sport_name, event_id, home_id, away_id):
     for tid in (home_id, away_id):
         defense[tid], n_def[tid] = build(pool, rows[tid], tid) if not pool.empty else ({}, 0)
 
-    # expected points: half recent form, half the Vegas line (when there is one)
+    # expected points: half recent form (adjusted for home court and rest), half the Vegas line
+    b2b = {t["id"]: _b2b(cfg, t["id"], game_date) for t in (home, away)} if nba else {home_id: False, away_id: False}
     exp_pts, model_pts = {}, {}
-    for t, side in ((home, "proj_team"), (away, "proj_opp")):
+    for t, opp, side in ((home, away, "proj_team"), (away, home, "proj_opp")):
         form_proj = env[side] if env else None
+        if nba and form_proj:
+            form_proj *= (1 + NBA_HOME_EDGE) if t is home else (1 - NBA_HOME_EDGE)
+            form_proj *= NBA_B2B_TEAM if b2b[t["id"]] else 1.0
+            form_proj *= NBA_B2B_OPP if b2b[opp["id"]] else 1.0
         implied = (env.get("implied") or {}).get(t["abbr"]) if env else None
         model_pts[t["id"]] = form_proj
         exp_pts[t["id"]] = (0.5 * form_proj + 0.5 * implied) if form_proj and implied else (form_proj or implied)
-    pace = {}
+    pace, forms = {}, {}
     for t in (home, away):
-        form = team_form(cfg, t["id"])
+        forms[t["id"]] = team_form(cfg, t["id"], as_of)
+        form = forms[t["id"]]
         raw = exp_pts[t["id"]] / form["for"] if form and exp_pts[t["id"]] and form["for"] else 1.0
         pace[t["id"]] = float(min(1.08, max(0.92, raw))) if nba else float(min(1.15, max(0.85, raw)))
+
+    # team scores first, so player sims can move with their team's score
+    h = a = None
+    if exp_pts[home_id] and exp_pts[away_id]:
+        h, a = _team_sims(rng, exp_pts[home_id], exp_pts[away_id], key)
 
     plist = []
     for t, opp in ((home, away), (away, home)):
         if nba:
-            plist += nba_players(cfg, t, players, injuries, rng, defense[opp["id"]], n_def[opp["id"]], pace[t["id"]])
+            if played:  # Model check: the players who actually played
+                roster = [{"id": pid, "name": nm, "pos": pos, "team_id": tid, "inj": ""} for pid, nm, pos, tid in played
+                          if tid == t["id"]]
+                here = {r["id"] for r in roster}
+                own = rows[t["id"]]
+                missing = frozenset(own[own["team_id"] == t["id"]]["pid"].unique()) - here if not own.empty else frozenset()
+                maybe = frozenset()
+            else:
+                inj = injuries.get(t["id"]) or injuries.get(t["name"]) or []
+                out_keys, maybe_keys = injured_keys(inj, out=True), injured_keys(inj, out=False)
+                team_players = [p for p in players if p["team_id"] == t["id"]]
+                is_out = lambda p: is_listed(p, out_keys) or status_class(p.get("inj", "")) == "s-out"
+                roster = [p for p in team_players if not is_out(p)]
+                missing = frozenset({p["id"] for p in team_players if is_out(p)} |
+                                    {r["id"] for r in inj if r.get("id") and status_class(r["status"]) == "s-out"})
+                maybe = frozenset(p["id"] for p in roster if is_listed(p, maybe_keys))
+            mine = h if t is home else a
+            ctx = {"as_of": as_of, "team_rows": rows[t["id"]], "exp_pts": exp_pts[t["id"]],
+                   "form_for": (forms[t["id"]] or {}).get("for"), "b2b": b2b[t["id"]], "opp_b2b": b2b[opp["id"]],
+                   "home": t is home, "pace": pace[t["id"]], "live": not played,
+                   "shock": np.clip(mine / exp_pts[t["id"]], 0.75, 1.25) if mine is not None else None,
+                   "margin": (h - a if t is home else a - h) if h is not None else None}
+            plist += nba_players_v2(cfg, t, roster, missing, maybe, rng, defense[opp["id"]], n_def[opp["id"]], ctx)
         else:
             plist += nfl_players(cfg, sport_name, t, players, injuries, rng, defense[opp["id"]], n_def[opp["id"]], pace[t["id"]])
 
     game = None
-    if exp_pts[home_id] and exp_pts[away_id]:
-        h, a = _team_sims(rng, exp_pts[home_id], exp_pts[away_id], key)
+    if h is not None:
         game = {"home_pts": float(np.median(h)), "away_pts": float(np.median(a)), "home_win": float((h > a).mean()),
-                "total": float(np.median(h + a)), "odds": (env or {}).get("odds")}
+                "total": float(np.median(h + a)), "odds": (env or {}).get("odds"), "b2b": b2b}
         odds = game["odds"] or {}
         if odds.get("total"):
             game["p_over"] = float((h + a > odds["total"]).mean())
@@ -2210,7 +2462,7 @@ def render_game(sport_name, g):
 
     with st.spinner("Running 10,000 simulations of this game (first open takes 15 to 30 seconds)..."):
         try:
-            res = simulate_game(sport_name, g["id"], g["home"], g["away"])
+            res = simulate_game(sport_name, g["id"], g["home"], g["away"], game_date=(g.get("date") or "")[:10])
         except Exception as e:
             st.error(f"Couldn't run this game right now. Try again in a minute. ({e})")
             return
@@ -2296,12 +2548,13 @@ def render_game(sport_name, g):
         why = []
         if nba:
             fd = p["f_def"].get("PTS", 1.0)
-            if abs(fd - 1) >= 0.03:
+            if abs(fd - 1) >= 0.05:
                 why.append(f'{"soft" if fd > 1 else "tough"} vs {p["group"].lower()} ({vs_avg(fd)} PTS)')
             if p["mins_recent"] - p["mins_normal"] >= 2:
                 why.append(f'minutes up ({p["mins_recent"]:.0f} lately vs {p["mins_normal"]:.0f})')
             if abs(p["pace"] - 1) >= 0.02:
                 why.append(f'{"fast" if p["pace"] > 1 else "slow"} game')
+            why += p.get("notes", [])
         else:
             if abs(p["f_slot"] - 1) >= 0.03:
                 why.append(f'{vs_avg(p["f_slot"])} yards allowed to {p["slot"]}s')
@@ -2449,14 +2702,166 @@ def render_game(sport_name, g):
                    "TD % = how often he scored at least one rushing or receiving TD.")
 
 
+# ---------- MODEL CHECK (NBA backtest) ----------
+# Rerun the model on games that already happened, using ONLY data from before each game,
+# then grade every prop against the real box score. This is how we know if changes actually help.
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def nba_finished_games(site, date_str):
+    """Completed games on one US date (YYYYMMDD)."""
+    data = get_json(f"{site}/scoreboard", params={"dates": date_str})
+    out = []
+    for e in data.get("events", []):
+        comp = (e.get("competitions") or [{}])[0]
+        status = (comp.get("status") or e.get("status") or {}).get("type", {})
+        if not (status.get("completed") or status.get("state") == "post"):
+            continue
+        sides = {c.get("homeAway"): c for c in comp.get("competitors", [])}
+        h, a = sides.get("home") or {}, sides.get("away") or {}
+        out.append({"id": str(e.get("id", "")), "date": e.get("date", ""), "label": e.get("shortName", ""),
+                    "home": str((h.get("team") or {}).get("id", "")), "away": str((a.get("team") or {}).get("id", "")),
+                    "home_pts": _score(h), "away_pts": _score(a)})
+    return out
+
+
+def grade_game(sport_name, g):
+    """Run the pre game model for a finished game and grade every prop."""
+    cfg = SPORTS[sport_name]
+    df = _clean_box(pd.DataFrame(load_boxscore(cfg["site"], g["id"])), "nba")
+    df = df[df["MIN"].fillna(0) > 0]
+    played = tuple(sorted((str(r["pid"]), r["Player"], r.get("pos") or "", str(r["team_id"])) for _, r in df.iterrows()))
+    as_of = g["date"][:10]
+    res = simulate_game(sport_name, g["id"], g["home"], g["away"], game_date=as_of, as_of=as_of, played=played)
+    actual = {str(r["pid"]): r for _, r in df.iterrows()}
+    props = []
+    for p in res["players"]:
+        act = actual.get(p["id"])
+        if act is None:
+            continue
+        for pr in p["props"]:
+            if pr["stat"] == "PRA":
+                val = sum(float(act.get(x) or 0) for x in ("PTS", "REB", "AST"))
+            else:
+                val = float(act.get(pr["stat"]) or 0)
+            props.append({"Game": g["label"], "Player": p["name"], "Stat": pr["stat"], "Line": pr["line"],
+                          "p": pr["p"], "p_norm": pr["p_norm"], "Actual": val, "over": val > pr["line"],
+                          "conf": p["conf"]})
+    game = res["game"] or {}
+    actual_total = (g["home_pts"] or 0) + (g["away_pts"] or 0)
+    vegas = ((game.get("odds") or {}) or {}).get("total")
+    return props, {"Game": g["label"], "Actual total": actual_total, "Model total": game.get("total"), "Vegas O/U": vegas}
+
+
+def render_model_check(sport_name):
+    cfg = SPORTS[sport_name]
+    section("📈 Model check", "how the model would have done on games that already happened")
+    st.caption("For each finished game, the model reruns using only data from before tip off, then every prop is "
+               "graded against the real box score. Check a few different nights: one night is a small sample.")
+    yesterday = dt.datetime.now(ET).date() - dt.timedelta(days=1)
+    c1, c2 = st.columns(2)
+    end = c1.date_input("Last night to check", value=yesterday, max_value=yesterday, key="mc_date")
+    days = c2.select_slider("Nights", options=[1, 2, 3], value=1, key="mc_days")
+    if not st.button("▶ Run model check", key="mc_run", type="primary"):
+        st.markdown('<div class="muted">Each game takes 10 to 20 seconds the first time, then it\'s saved.</div>',
+                    unsafe_allow_html=True)
+        return
+    games = []
+    for i in range(days):
+        d = end - dt.timedelta(days=i)
+        try:
+            games += nba_finished_games(cfg["site"], d.strftime("%Y%m%d"))
+        except Exception:
+            pass
+    if not games:
+        st.info("No finished games found for those dates.")
+        return
+    bar = st.progress(0.0, text="Rerunning games...")
+    all_props, totals = [], []
+    for i, g in enumerate(games, 1):
+        try:
+            props, tot = grade_game(sport_name, g)
+            all_props += props
+            totals.append(tot)
+        except Exception:
+            pass
+        bar.progress(i / len(games), text=f"Rerunning games... {i} of {len(games)}")
+    bar.empty()
+    if not all_props:
+        st.info("Couldn't grade any props for those dates.")
+        return
+    df = pd.DataFrame(all_props)
+    y = df["over"].astype(float)
+    brier_model = float(((df["p"] - y) ** 2).mean())
+    brier_naive = float(((df["p_norm"] - y) ** 2).mean())
+    gain = (brier_naive - brier_model) / brier_naive if brier_naive else 0
+    df["side"] = np.where(df["p"] >= 0.5, "Over", "Under")
+    df["p_side"] = np.where(df["p"] >= 0.5, df["p"], 1 - df["p"])
+    df["hit"] = np.where(df["side"] == "Over", df["over"], ~df["over"])
+    leans = df[(df["p_side"] >= 0.55) & ((df["p"] - df["p_norm"]).abs() >= PROP_MIN_MOVE)]
+    strong = df[df["p_side"] >= 0.60]
+
+    def rec(d):
+        return f'{int(d["hit"].sum())}–{int((~d["hit"].astype(bool)).sum())}' if len(d) else "0–0"
+
+    cards = [("Props graded", f'{len(df)}', f'{len(games)} games'),
+             ("Picks the model liked", f'{leans["hit"].mean():.0%}' if len(leans) else "—", f'{rec(leans)} (55%+ and moved by the matchup)'),
+             ("Strong picks (60%+)", f'{strong["hit"].mean():.0%}' if len(strong) else "—", rec(strong)),
+             ("Better than a normal night?", f'{gain:+.1%}', "error vs just using his averages (higher is better)")]
+    st.markdown('<div class="cards">' + "".join(
+        f'<div class="card"><div class="card-label">{l}</div><div class="card-value">{v}</div><div class="muted">{n}</div></div>'
+        for l, v, n in cards) + '</div>', unsafe_allow_html=True)
+    st.caption("A pick is worth betting at standard -110 odds only if it hits more than 52.4% of the time.")
+
+    section("Calibration", "when the model said X%, how often did it actually hit?")
+    bins = [0.5, 0.55, 0.6, 0.65, 0.7, 1.01]
+    labels = ["50–55%", "55–60%", "60–65%", "65–70%", "70%+"]
+    df["bucket"] = pd.cut(df["p_side"], bins=bins, labels=labels, right=False)
+    cal = df.groupby("bucket", observed=False).agg(Picks=("hit", "size"), Model_said=("p_side", "mean"),
+                                                   Actually_hit=("hit", "mean")).reset_index()
+    cal["Model_said"] = cal["Model_said"].map(lambda x: f"{x:.0%}" if pd.notna(x) else "")
+    cal["Actually_hit"] = cal["Actually_hit"].map(lambda x: f"{x:.0%}" if pd.notna(x) else "")
+    st.dataframe(cal.rename(columns={"bucket": "Model confidence", "Model_said": "Model said", "Actually_hit": "Actually hit"}),
+                 hide_index=True, width="stretch")
+    st.caption("Good calibration = the two percentage columns are close. If 'Actually hit' is lower, the model is overconfident.")
+
+    by_stat = df.groupby("Stat").agg(Props=("hit", "size"), Hit_rate=("hit", "mean")).reset_index()
+    by_stat["Hit_rate"] = by_stat["Hit_rate"].map(lambda x: f"{x:.0%}")
+    c1, c2 = st.columns(2)
+    with c1:
+        section("By stat")
+        st.dataframe(by_stat.rename(columns={"Hit_rate": "Lean hit rate"}), hide_index=True, width="stretch")
+    with c2:
+        section("Game totals")
+        t = pd.DataFrame(totals)
+        if not t.empty and t["Model total"].notna().any():
+            mae_m = (t["Model total"] - t["Actual total"]).abs().mean()
+            line = f'Model off by {mae_m:.1f} pts on average'
+            if t["Vegas O/U"].notna().any():
+                tv = t.dropna(subset=["Vegas O/U"])
+                line += f' · Vegas off by {(tv["Vegas O/U"] - tv["Actual total"]).abs().mean():.1f}'
+            st.markdown(f'<div class="muted">{line}</div>', unsafe_allow_html=True)
+            st.dataframe(t.round(1), hide_index=True, width="stretch")
+
+    section("Every pick the model liked", "✅ hit · ❌ missed")
+    show = leans.sort_values("p_side", ascending=False).copy()
+    show["Pick"] = show["side"] + " " + show["Line"].map(lambda x: f"{x:g}") + " " + show["Stat"]
+    show["Model"] = show["p_side"].map(lambda x: f"{x:.0%}")
+    show["Result"] = np.where(show["hit"], "✅", "❌")
+    st.dataframe(show[["Game", "Player", "Pick", "Model", "Actual", "Result", "conf"]].rename(columns={"conf": "Confidence"}),
+                 hide_index=True, width="stretch")
+    st.caption("Honest note: the model check knows who actually played, so injuries are perfect here. "
+               "Live picks depend on the injury report being right before tip off.")
+
+
 # ---------- ONE SPORT ----------
 def render_sport(sport_name):
     key = SPORTS[sport_name]["key"]
-    views = ["🔎 Player lookup", "📋 Slate"]
+    views = ["🔎 Player lookup", "📋 Slate"] + (["📈 Model check"] if key == "nba" else [])
     view = st.segmented_control("View", views, default=views[0], label_visibility="collapsed",
                                 key=f"{key}_view") or views[0]
-    if view == views[1]:
+    if view == "📋 Slate":
         render_slate(sport_name)
+    elif view == "📈 Model check":
+        render_model_check(sport_name)
     else:
         render_player(sport_name)
 
