@@ -1,6 +1,5 @@
 streamlit>=1.50
-pandas
-numpy
-pyarrow
-requests
-tzdata
+numpy>=1.26
+pandas>=2.1
+requests>=2.31
+pyarrow>=14
